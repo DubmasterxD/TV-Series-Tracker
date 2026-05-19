@@ -1,0 +1,13 @@
+### Python
+# Byte-compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+tv_tracker/data.json
+*.spec
