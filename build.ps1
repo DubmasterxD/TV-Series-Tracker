@@ -15,7 +15,7 @@ foreach ($pkg in $packages) {
 }
 
 Write-Host "Building..."
-pyinstaller TVSeriesTracker.spec --noconfirm
+py -m PyInstaller TVSeriesTracker.spec --noconfirm
 
 if ($LASTEXITCODE -eq 0) {
     Write-Host "Build complete: dist\TVSeriesTracker.exe"
