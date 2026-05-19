@@ -10,4 +10,3 @@ dist/
 *.egg-info/
 *.egg
 tv_tracker/data.json
-*.spec
