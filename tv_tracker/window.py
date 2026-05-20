@@ -1,4 +1,5 @@
 import threading
+import time
 from datetime import datetime
 from PyQt6.QtCore import Qt, QTimer, QMetaObject, pyqtSlot
 from PyQt6.QtWidgets import (
@@ -17,6 +18,8 @@ class MainWindow(QMainWindow):
         self._cards: dict[int, SeriesCard] = {}
         self._p2w_cards: dict[int, P2WCard] = {}
         self._section_headers: dict[str, QLabel] = {}
+        self._build_queue: list = []
+        self._build_result: tuple | None = None
         self._kind_filter: str | None = None
         self._filter_btns: dict[str, QPushButton] = {}
         self._spin_result_name: str | None = None
@@ -244,17 +247,87 @@ class MainWindow(QMainWindow):
         result = self._tracker.load()
         n = len(self._tracker.series)
         if result == "ok":
-            self._set_status(f"Auto-loaded {n} record{'s' if n != 1 else ''} from storage")
+            self._set_status(f"Loading {n} series…")
         elif result == "empty":
             self._set_status("No saved data yet — add your first series below")
         else:
             self._set_status("Storage error — data added this session won't be saved")
-        self._rebuild()
+        QTimer.singleShot(0, lambda: self._load_done(result, n))
+
+    def _load_done(self, result: str, n: int):
+        self._clear_both_columns()
+        # Build a flat ordered queue so cards appear progressively
+        self._build_queue = []
+        for kind, label_text in self._KIND_LABELS:
+            group = [s for s in self._tracker.series
+                     if s.kind == kind and any(not v.p2w for v in s.seasons.values())]
+            if group:
+                self._build_queue.append(('header', kind, label_text))
+                for s in group:
+                    self._build_queue.append(('left', s))
+        for s in self._tracker.series:
+            if any(v.p2w for v in s.seasons.values()):
+                self._build_queue.append(('right', s))
+        self._build_result = (result, n)
+        QTimer.singleShot(0, self._process_next_batch)
+
+    _TICK_BUDGET = 0.001  # seconds per tick — leaves headroom for Qt to repaint
+
+    def _process_next_batch(self):
+        deadline = time.perf_counter() + self._TICK_BUDGET
+        self._left_content.setUpdatesEnabled(False)
+        self._right_content.setUpdatesEnabled(False)
+        try:
+            while self._build_queue and time.perf_counter() < deadline:
+                item = self._build_queue.pop(0)
+                if item[0] == 'header':
+                    _, kind, label_text = item
+                    hdr = QLabel(label_text)
+                    hdr.setObjectName("list_section_lbl")
+                    self._list_layout.addWidget(hdr)
+                    self._section_headers[kind] = hdr
+                elif item[0] == 'left':
+                    _, s = item
+                    card = SeriesCard(s)
+                    card.watch_requested.connect(self._on_watch)
+                    card.delete_requested.connect(self._on_delete)
+                    card.auto_save_requested.connect(self._on_auto_save)
+                    card.add_season_requested.connect(self._on_add_season)
+                    card.complete_requested.connect(self._on_complete)
+                    card.rate_requested.connect(self._on_rate)
+                    card.season_delete_requested.connect(self._on_delete_season)
+                    card.edit_closed.connect(self._on_edit_closed)
+                    self._list_layout.addWidget(card)
+                    self._cards[s.id] = card
+                elif item[0] == 'right':
+                    _, s = item
+                    p2w_card = P2WCard(s)
+                    p2w_card.p2w_remove_requested.connect(self._on_p2w_remove)
+                    p2w_card.delete_requested.connect(self._on_delete)
+                    p2w_card.season_delete_requested.connect(self._on_delete_season)
+                    p2w_card.auto_save_requested.connect(self._on_p2w_auto_save)
+                    self._p2w_layout.addWidget(p2w_card)
+                    self._p2w_cards[s.id] = p2w_card
+        finally:
+            self._left_content.setUpdatesEnabled(True)
+            self._right_content.setUpdatesEnabled(True)
+
+        if self._build_queue:
+            QTimer.singleShot(0, self._process_next_batch)
+        else:
+            result, n = self._build_result
+            if result == "ok":
+                self._set_status(f"Auto-loaded {n} record{'s' if n != 1 else ''} from storage")
+            n_total = len(self._tracker.series)
+            self.setWindowTitle(f"My Series Tracker{'  —  ' + str(n_total) + ' series' if n_total else ''}")
+            self._update_spin_wheel()
+            self._apply_filter()
 
     _KIND_LABELS = [("tv", "📺  TV SERIES"), ("anime", "🎌  ANIME"),
                     ("movie", "🎬  MOVIES"), ("horror", "👻  HORROR")]
 
     def _rebuild(self):
+        self._build_queue.clear()  # cancel any in-progress incremental load
         self._left_content.setUpdatesEnabled(False)
         self._right_content.setUpdatesEnabled(False)
         try:
@@ -263,26 +336,25 @@ class MainWindow(QMainWindow):
             self._left_content.setUpdatesEnabled(True)
             self._right_content.setUpdatesEnabled(True)
 
-    def _rebuild_inner(self):
-        # Clear left column
+    def _clear_both_columns(self):
         while self._list_layout.count():
             item = self._list_layout.takeAt(0)
             if item.widget():
                 w = item.widget()
                 w.hide()
                 w.setParent(None)
-
-        # Clear right (P2W) column
         while self._p2w_layout.count():
             item = self._p2w_layout.takeAt(0)
             if item.widget():
                 w = item.widget()
                 w.hide()
                 w.setParent(None)
-
         self._cards = {}
         self._p2w_cards = {}
         self._section_headers = {}
+
+    def _rebuild_inner(self):
+        self._clear_both_columns()
 
         by_kind = {k: [s for s in self._tracker.series if s.kind == k]
                    for k, _ in self._KIND_LABELS}
