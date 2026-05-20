@@ -211,6 +211,54 @@ QComboBox#rating_combo QAbstractItemView {{
     color: {TEXT};
     padding: 2px;
 }}
+QPushButton#rating_combo {{
+    background: {SURFACE2};
+    border: 1px solid {BORDER};
+    border-radius: 6px;
+    padding: 2px 5px;
+    font-size: 11px;
+    color: {TEXT};
+    text-align: left;
+}}
+QPushButton#rating_combo:hover {{ border-color: {MUTED}; }}
+QPushButton#rating_combo:pressed {{ border-color: {TEAL}; }}
+QMenu#rating_menu {{
+    background: {SURFACE2};
+    border: 1px solid {BORDER};
+    border-radius: 6px;
+    padding: 2px;
+}}
+QMenu#rating_menu::item {{
+    padding: 2px 10px;
+    font-size: 11px;
+    color: {TEXT};
+    border-radius: 4px;
+}}
+QMenu#rating_menu::item:selected {{ background: {TEAL_DIM}; }}
+
+/* ── Edit overlay ── */
+QFrame#edit_dialog_panel {{
+    background: {SURFACE};
+    border: 1px solid {BORDER};
+    border-radius: 10px;
+}}
+QWidget#edit_dialog_titlebar {{
+    background: {SURFACE2};
+    border-bottom: 1px solid {BORDER};
+}}
+QLabel#edit_dialog_title_lbl {{
+    font-size: 13px;
+    font-weight: 600;
+    color: {TEXT};
+}}
+QScrollArea#edit_dialog_scroll,
+QScrollArea#edit_dialog_scroll > QWidget > QWidget {{
+    background: transparent;
+    border: none;
+}}
+QWidget#edit_dialog_content {{
+    background: transparent;
+}}
 
 /* ── Progress bar ── */
 QProgressBar {{

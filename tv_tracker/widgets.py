@@ -5,7 +5,7 @@ from PyQt6.QtGui import QValidator, QPainter, QColor, QPen, QBrush, QFont, QPoly
 from PyQt6.QtWidgets import (
     QWidget, QFrame, QLabel, QPushButton, QLineEdit, QSpinBox, QComboBox,
     QAbstractSpinBox, QProgressBar, QHBoxLayout, QVBoxLayout, QSizePolicy,
-    QDialog, QRadioButton, QGroupBox, QFileDialog,
+    QScrollArea, QDialog, QRadioButton, QGroupBox, QFileDialog, QMenu,
 )
 from models import Series, Season
 
@@ -190,18 +190,23 @@ class SeasonRow(QWidget):
         pc.addWidget(_lbl(f"{season.watched} / {season.episodes} eps ({pct}%)", "eps_label"))
         layout.addWidget(prog_col, 1)
 
-        rating_combo = QComboBox()
-        rating_combo.setObjectName("rating_combo")
-        rating_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
-        rating_combo.setMinimumContentsLength(2)
-        rating_combo.addItem("Rate")
-        for i in range(1, 11):
-            rating_combo.addItem(f"★ {i}")
-        rating_combo.setCurrentIndex(season.rating)
-        rating_combo.currentIndexChanged.connect(
-            lambda idx: self.rate_requested.emit(self._series_id, self._season_num, idx)
-        )
-        layout.addWidget(rating_combo)
+        rating_btn = QPushButton(f"★ {season.rating}" if season.rating else "Rate")
+        rating_btn.setObjectName("rating_combo")
+
+        def _show_rating_menu(_checked=False, btn=rating_btn):
+            menu = QMenu()
+            menu.setObjectName("rating_menu")
+            menu.addAction(" — ").setData(0)
+            for i in range(1, 11):
+                menu.addAction(f"★ {i}").setData(i)
+            chosen = menu.exec(btn.mapToGlobal(btn.rect().bottomLeft()))
+            if chosen is not None:
+                val = chosen.data()
+                btn.setText(f"★ {val}" if val else "Rate")
+                self.rate_requested.emit(self._series_id, self._season_num, val)
+
+        rating_btn.clicked.connect(_show_rating_menu)
+        layout.addWidget(rating_btn)
 
         if season.watched >= season.episodes:
             layout.addWidget(_lbl("✓ done", "done_badge"))
@@ -221,24 +226,17 @@ class SeasonRow(QWidget):
 
 
 class SeriesCard(QFrame):
-    watch_requested          = pyqtSignal('qlonglong', int)
-    delete_requested         = pyqtSignal('qlonglong')
-    auto_save_requested      = pyqtSignal('qlonglong', str, str, object, dict)
-    add_season_requested     = pyqtSignal('qlonglong', int, int, bool)   # id, season_num, eps, p2w
-    complete_requested       = pyqtSignal('qlonglong', int)
-    rate_requested           = pyqtSignal('qlonglong', int, int)
-    season_delete_requested  = pyqtSignal('qlonglong', int)
-    edit_closed              = pyqtSignal('qlonglong')
-    dirty_requested          = pyqtSignal('qlonglong')                       # after reorder
-    eject_season_requested   = pyqtSignal('qlonglong', str, str)             # id, season_key, new_name
-    absorb_requested         = pyqtSignal('qlonglong', str, str)             # id, target_name, label
+    watch_requested    = pyqtSignal('qlonglong', int)
+    delete_requested   = pyqtSignal('qlonglong')
+    complete_requested = pyqtSignal('qlonglong', int)
+    rate_requested     = pyqtSignal('qlonglong', int, int)
+    dirty_requested    = pyqtSignal('qlonglong')
+    edit_requested     = pyqtSignal('qlonglong')
 
     def __init__(self, series: Series, parent: QWidget = None):
         super().__init__(parent)
         self._series = series
         self._season_rows: dict[str, SeasonRow] = {}
-        self._season_inputs: dict[str, dict] = {}   # populated lazily on first edit-panel open
-        self._edit_panel = None                      # built lazily on first edit-panel open
         self.setObjectName("series_card")
 
         active_seasons = {k: v for k, v in series.seasons.items() if not v.p2w}
@@ -290,7 +288,7 @@ class SeriesCard(QFrame):
         edit_btn.setObjectName("btn_edit")
         edit_btn.setFixedSize(30, 28)
         edit_btn.setToolTip("Edit")
-        edit_btn.clicked.connect(self._toggle_edit)
+        edit_btn.clicked.connect(lambda: self.edit_requested.emit(series.id))
         hl.addWidget(edit_btn)
 
         del_btn = QPushButton("🗑")
@@ -322,51 +320,192 @@ class SeriesCard(QFrame):
             self._season_rows[sn_str] = row
 
         outer.addWidget(seasons_body)
-        # Edit panel is built lazily on first open — see _toggle_edit()
 
-    # ── Edit panel construction ──────────────────────────────────
+    # ── Actions ──────────────────────────────────────────────────
 
-    def _build_edit_panel(self, series: Series) -> QFrame:
-        panel = QFrame()
-        panel.setObjectName("edit_panel")
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(16, 12, 16, 14)
-        layout.setSpacing(10)
+    def _reorder_season(self, season_num: int, up: bool):
+        keys = sorted(self._series.seasons.keys(), key=int)
+        idx = keys.index(str(season_num))
+        if up and idx > 0:
+            self._swap_seasons(str(season_num), keys[idx - 1])
+        elif not up and idx < len(keys) - 1:
+            self._swap_seasons(str(season_num), keys[idx + 1])
 
-        note = _lbl("ℹ  Edit episodes or ratings, or add seasons below.", "edit_note")
-        note.setWordWrap(True)
-        layout.addWidget(note)
+    def _swap_seasons(self, key1: str, key2: str):
+        if key2 is None or key1 not in self._series.seasons or key2 not in self._series.seasons:
+            return
+        s = self._series.seasons
+        s[key1], s[key2] = s[key2], s[key1]
+        self._refresh_seasons_ui()
+        self.dirty_requested.emit(self._series.id)
 
-        layout.addWidget(_lbl("Series name", "field_label"))
+    def _refresh_seasons_ui(self):
+        """Rebuild season view rows and edit blocks after in-place data mutation."""
+        while self._seasons_layout.count():
+            item = self._seasons_layout.takeAt(0)
+            if w := item.widget():
+                w.setParent(None)
+        self._season_rows = {}
+
+        active = {k: v for k, v in self._series.seasons.items() if not v.p2w}
+        sorted_active = sorted(active.keys(), key=int)
+        for i, sn_str in enumerate(sorted_active):
+            if i > 0:
+                self._seasons_layout.addWidget(_hline())
+            row = SeasonRow(self._series.id, int(sn_str), active[sn_str],
+                            is_first=(i == 0), is_last=(i == len(sorted_active) - 1))
+            row.watch_requested.connect(self.watch_requested)
+            row.complete_requested.connect(self.complete_requested)
+            row.rate_requested.connect(self.rate_requested)
+            row.move_up_requested.connect(lambda sn=int(sn_str): self._reorder_season(sn, up=True))
+            row.move_down_requested.connect(lambda sn=int(sn_str): self._reorder_season(sn, up=False))
+            self._seasons_layout.addWidget(row)
+            self._season_rows[sn_str] = row
+
+        self._recheck_completed()
+        self._refresh_avg_badge()
+
+    def update_season_rating(self, season_num: int, rating: int):
+        self._refresh_avg_badge()
+
+    def _recheck_completed(self):
+        active = {k: v for k, v in self._series.seasons.items() if not v.p2w}
+        has_p2w = any(v.p2w for v in self._series.seasons.values())
+        completed = (
+            bool(active)
+            and not has_p2w
+            and all(v.watched >= v.episodes for v in active.values())
+        )
+        self.setProperty("completed", "true" if completed else "false")
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+    def _refresh_avg_badge(self):
+        active = {k: v for k, v in self._series.seasons.items() if not v.p2w}
+        rated = [v.rating for v in active.values() if v.rating > 0]
+        avg = round(sum(rated) / len(rated)) if rated else None
+        if avg is not None:
+            self._avg_lbl.setText(f"⭐ {avg}")
+            self._avg_lbl.setVisible(True)
+        else:
+            self._avg_lbl.setVisible(False)
+
+    def update_name(self, name: str, alt_names: list[str] = None):
+        self._name_lbl.setText(name)
+        if alt_names is not None:
+            self._altname_lbl.setText("  /  ".join(alt_names))
+            self._altname_lbl.setVisible(bool(alt_names))
+
+    def apply_watch(self, season_num: int, updated_season: Season):
+        """Replace a SeasonRow in-place and sync the edit panel spinbox."""
+        key = str(season_num)
+        old_row = self._season_rows.get(key)
+        if old_row:
+            idx = self._seasons_layout.indexOf(old_row)
+            self._seasons_layout.removeWidget(old_row)
+            old_row.setParent(None)
+            new_row = SeasonRow(self._series.id, season_num, updated_season)
+            new_row.watch_requested.connect(self.watch_requested)
+            new_row.complete_requested.connect(self.complete_requested)
+            new_row.rate_requested.connect(self.rate_requested)
+            self._seasons_layout.insertWidget(idx, new_row)
+            self._season_rows[key] = new_row
+        self._series.seasons[key] = updated_season
+        self._recheck_completed()
+
+    def update_kind_icon(self, kind: str):
+        pass
+
+
+class SeriesEditDialog(QWidget):
+    """Full-window overlay that blocks the background and contains the edit form."""
+    auto_save_requested     = pyqtSignal('qlonglong', str, str, object, dict)
+    add_season_requested    = pyqtSignal('qlonglong', int, int, bool)
+    season_delete_requested = pyqtSignal('qlonglong', int)
+    eject_season_requested  = pyqtSignal('qlonglong', str, str)
+    absorb_requested        = pyqtSignal('qlonglong', str, str)
+    closed                  = pyqtSignal('qlonglong')
+
+    def __init__(self, series: Series, parent: QWidget):
+        super().__init__(parent)
+        self._series = series
+        self._season_inputs: dict[str, dict] = {}
+
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self.setGeometry(parent.rect())
+        parent.installEventFilter(self)
+
+        # ── Outer layout: centres the panel, margins = dark halo ─
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(60, 40, 60, 40)
+        outer.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self._panel = QFrame()
+        self._panel.setObjectName("edit_dialog_panel")
+        self._panel.setFixedWidth(560)
+        self._panel.setMaximumHeight(int(parent.height() * 0.88))
+
+        panel_vbox = QVBoxLayout(self._panel)
+        panel_vbox.setContentsMargins(0, 0, 0, 0)
+        panel_vbox.setSpacing(0)
+
+        # ── Title bar ─────────────────────────────────────────────
+        title_bar = QWidget()
+        title_bar.setObjectName("edit_dialog_titlebar")
+        tb = QHBoxLayout(title_bar)
+        tb.setContentsMargins(16, 10, 10, 10)
+        tb.setSpacing(8)
+        title_lbl = QLabel(series.name)
+        title_lbl.setObjectName("edit_dialog_title_lbl")
+        tb.addWidget(title_lbl, 1)
+        close_btn = QPushButton("✕")
+        close_btn.setObjectName("btn_del")
+        close_btn.setFixedSize(28, 28)
+        close_btn.clicked.connect(self.close)
+        tb.addWidget(close_btn)
+        panel_vbox.addWidget(title_bar)
+
+        sep = _hline()
+        panel_vbox.addWidget(sep)
+
+        # ── Scroll area with all form content ─────────────────────
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setObjectName("edit_dialog_scroll")
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+
+        content = QWidget()
+        content.setObjectName("edit_dialog_content")
+        cl = QVBoxLayout(content)
+        cl.setContentsMargins(16, 14, 16, 16)
+        cl.setSpacing(10)
+
+        cl.addWidget(_lbl("Series name", "field_label"))
         self._name_input = QLineEdit(series.name)
-        self._name_input.editingFinished.connect(self._auto_save_name)
-        layout.addWidget(self._name_input)
+        self._name_input.editingFinished.connect(self._auto_save)
+        cl.addWidget(self._name_input)
 
-        layout.addWidget(_lbl("Type", "field_label"))
+        cl.addWidget(_lbl("Type", "field_label"))
         self._kind_selector = KindSelector(series.kind)
-        self._kind_selector.changed.connect(lambda _: self._auto_save_name())
-        layout.addWidget(self._kind_selector)
+        self._kind_selector.changed.connect(lambda _: self._auto_save())
+        cl.addWidget(self._kind_selector)
 
-        layout.addWidget(_lbl("Alternative names", "field_label"))
+        cl.addWidget(_lbl("Alternative names", "field_label"))
         self._alt_names_input = QLineEdit(", ".join(series.alt_names))
         self._alt_names_input.setPlaceholderText("e.g. ワンピース, One Piece, OP")
-        self._alt_names_input.editingFinished.connect(self._auto_save_name)
-        layout.addWidget(self._alt_names_input)
-        layout.addWidget(_hline())
+        self._alt_names_input.editingFinished.connect(self._auto_save)
+        cl.addWidget(self._alt_names_input)
+        cl.addWidget(_hline())
 
-        self._season_inputs: dict[str, dict] = {}
         blocks_container = _transparent()
         self._edit_blocks_layout = QVBoxLayout(blocks_container)
         self._edit_blocks_layout.setContentsMargins(0, 0, 0, 0)
         self._edit_blocks_layout.setSpacing(8)
-
         for sn_str in sorted(series.seasons.keys(), key=int):
-            block = self._make_season_block(sn_str, series.seasons[sn_str])
-            self._edit_blocks_layout.addWidget(block)
+            self._edit_blocks_layout.addWidget(self._make_season_block(sn_str, series.seasons[sn_str]))
+        cl.addWidget(blocks_container)
 
-        layout.addWidget(blocks_container)
-
-        # ── Add new season block ─────────────────────────────────
         new_block = QFrame()
         new_block.setObjectName("new_season_block")
         nb = QVBoxLayout(new_block)
@@ -376,7 +515,6 @@ class SeriesCard(QFrame):
 
         pair_row = QHBoxLayout()
         pair_row.setSpacing(8)
-
         sn_col = _transparent()
         sc = QVBoxLayout(sn_col)
         sc.setContentsMargins(0, 0, 0, 0)
@@ -389,7 +527,6 @@ class SeriesCard(QFrame):
         self._new_sn.setValue(len(series.seasons) + 1)
         sc.addWidget(self._new_sn)
         pair_row.addWidget(sn_col)
-
         ep_col = _transparent()
         epc = QVBoxLayout(ep_col)
         epc.setContentsMargins(0, 0, 0, 0)
@@ -403,45 +540,36 @@ class SeriesCard(QFrame):
         epc.addWidget(self._new_eps)
         pair_row.addWidget(ep_col)
         nb.addLayout(pair_row)
-
         nb.addWidget(_lbl("Label (optional)", "field_label"))
         self._new_label = QLineEdit()
         self._new_label.setPlaceholderText("e.g. Part 1, OVA, Arc name…")
         nb.addWidget(self._new_label)
 
-        # Two buttons in same row: Add to watching + Add to P2W
         add_btn_row = QHBoxLayout()
         add_btn_row.setSpacing(8)
-
         add_season_btn = QPushButton("＋  Add season")
         add_season_btn.setObjectName("btn_add")
         add_season_btn.clicked.connect(lambda: self._on_add_season(False))
         add_btn_row.addWidget(add_season_btn)
-
         add_p2w_btn = QPushButton("＋  Add to Plan to Watch")
         add_p2w_btn.setObjectName("btn_p2w")
         add_p2w_btn.clicked.connect(lambda: self._on_add_season(True))
         add_btn_row.addWidget(add_p2w_btn)
-
         nb.addLayout(add_btn_row)
-        layout.addWidget(new_block)
+        cl.addWidget(new_block)
 
         self._absorb_btn = QPushButton("⬆  Make a season of another series…")
         self._absorb_btn.setObjectName("btn_p2w")
         self._absorb_btn.clicked.connect(self._on_absorb)
         self._absorb_btn.setVisible(len(series.seasons) == 1)
-        layout.addWidget(self._absorb_btn)
+        cl.addWidget(self._absorb_btn)
+        cl.addStretch()
 
-        btn_row = QHBoxLayout()
-        btn_row.addStretch()
-        close_btn = QPushButton("Close")
-        close_btn.setObjectName("btn_cancel")
-        close_btn.clicked.connect(self._close_edit)
-        btn_row.addWidget(close_btn)
-        layout.addLayout(btn_row)
+        scroll.setWidget(content)
+        panel_vbox.addWidget(scroll, 1)
 
-        panel.installEventFilter(self)
-        return panel
+        outer.addWidget(self._panel)
+        self.raise_()
 
     def _make_season_block(self, sn_str: str, season: Season) -> QFrame:
         block = QFrame()
@@ -461,14 +589,12 @@ class SeriesCard(QFrame):
         eject_btn.clicked.connect(lambda _, k=sn_str: self._on_eject_season(k))
         header_row.addWidget(eject_btn)
 
-        del_season_btn = QPushButton("✕")
-        del_season_btn.setObjectName("btn_del")
-        del_season_btn.setFixedSize(24, 22)
-        del_season_btn.setToolTip(f"Remove Season {sn_str}")
-        del_season_btn.clicked.connect(
-            lambda _, sn=int(sn_str): self.season_delete_requested.emit(self._series.id, sn)
-        )
-        header_row.addWidget(del_season_btn)
+        del_btn = QPushButton("✕")
+        del_btn.setObjectName("btn_del")
+        del_btn.setFixedSize(24, 22)
+        del_btn.setToolTip(f"Remove Season {sn_str}")
+        del_btn.clicked.connect(lambda _, k=sn_str, b=block: self._remove_season_block(k, b))
+        header_row.addWidget(del_btn)
         bl.addLayout(header_row)
 
         bl.addWidget(_lbl("Label (optional)", "field_label"))
@@ -506,14 +632,15 @@ class SeriesCard(QFrame):
         fields_row.addWidget(w_col)
 
         eps_spin.editingFinished.connect(lambda e=eps_spin, ws=w_spin: ws.setMaximum(e.value()))
-
         bl.addLayout(fields_row)
 
         def _save(sn=sn_str, e=eps_spin, w=w_spin, li=label_input):
             rating = self._series.seasons[sn].rating if sn in self._series.seasons else 0
-            name = self._name_input.text().strip() or self._series.name
             self.auto_save_requested.emit(
-                self._series.id, name, self._kind_selector.value, self._alt_names_parsed(),
+                self._series.id,
+                self._name_input.text().strip() or self._series.name,
+                self._kind_selector.value,
+                self._alt_names_parsed(),
                 {sn: {"episodes": e.value(), "watched": w.value(),
                       "rating": rating, "label": li.text().strip()}},
             )
@@ -525,77 +652,52 @@ class SeriesCard(QFrame):
         self._season_inputs[sn_str] = {"eps": eps_spin, "watched": w_spin, "label": label_input}
         return block
 
-    # ── Actions ──────────────────────────────────────────────────
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor(0, 0, 0, 170))
 
-    def _toggle_edit(self):
-        if self._edit_panel is None:
-            self._edit_panel = self._build_edit_panel(self._series)
-            self._edit_panel.setVisible(False)
-            self._outer.addWidget(self._edit_panel)
-        self._edit_panel.setVisible(not self._edit_panel.isVisible())
+    def mousePressEvent(self, event):
+        event.accept()   # swallow all clicks so nothing behind is reachable
 
-    def _close_edit(self):
-        if self._edit_panel is not None:
-            self._edit_panel.setVisible(False)
-        self.edit_closed.emit(self._series.id)
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            self.close()
+        else:
+            super().keyPressEvent(event)
 
     def eventFilter(self, obj, event):
-        """Close the edit panel when clicking on its background (not on child widgets)."""
-        if (self._edit_panel is not None
-                and obj is self._edit_panel
-                and event.type() == QEvent.Type.MouseButtonPress):
-            if self._edit_panel.childAt(event.pos()) is None:
-                self._close_edit()
-                return True
-        return super().eventFilter(obj, event)
+        if obj is self.parent() and event.type() == QEvent.Type.Resize:
+            self.setGeometry(self.parent().rect())
+            self._panel.setMaximumHeight(int(self.parent().height() * 0.88))
+        return False
+
+    def closeEvent(self, event):
+        self.parent().removeEventFilter(self)
+        self.closed.emit(self._series.id)
+        super().closeEvent(event)
+
+    def _remove_season_block(self, sn_str: str, block: QFrame):
+        block.setParent(None)
+        self._season_inputs.pop(sn_str, None)
+        self.season_delete_requested.emit(self._series.id, int(sn_str))
+        self._absorb_btn.setVisible(len(self._series.seasons) == 1)
 
     def _on_add_season(self, p2w: bool = False):
         sn_val  = self._new_sn.value()
         eps_val = self._new_eps.value()
         key     = str(sn_val)
-
         if key in self._series.seasons:
             return
-
         lbl_val    = self._new_label.text().strip()
         new_season = Season(episodes=eps_val, watched=0, rating=0, label=lbl_val, p2w=p2w)
         self._series.seasons[key] = new_season
-
-        if not p2w:
-            if self._season_rows:
-                self._seasons_layout.addWidget(_hline())
-            row = SeasonRow(self._series.id, sn_val, new_season)
-            row.watch_requested.connect(self.watch_requested)
-            row.complete_requested.connect(self.complete_requested)
-            row.rate_requested.connect(self.rate_requested)
-            self._seasons_layout.addWidget(row)
-            self._season_rows[key] = row
-
-        block = self._make_season_block(key, new_season)
-        self._edit_blocks_layout.addWidget(block)
-
+        self._edit_blocks_layout.addWidget(self._make_season_block(key, new_season))
         self.add_season_requested.emit(self._series.id, sn_val, eps_val, p2w)
-
+        self._absorb_btn.setVisible(len(self._series.seasons) == 1)
         next_sn = max(int(k) for k in self._series.seasons) + 1
         self._new_sn.setValue(next_sn)
         self._new_eps.setValue(10)
         self._new_label.clear()
-
-    def _reorder_season(self, season_num: int, up: bool):
-        keys = sorted(self._series.seasons.keys(), key=int)
-        idx = keys.index(str(season_num))
-        if up and idx > 0:
-            self._swap_seasons(str(season_num), keys[idx - 1])
-        elif not up and idx < len(keys) - 1:
-            self._swap_seasons(str(season_num), keys[idx + 1])
-
-    def _swap_seasons(self, key1: str, key2: str):
-        if key2 is None or key1 not in self._series.seasons or key2 not in self._series.seasons:
-            return
-        s = self._series.seasons
-        s[key1], s[key2] = s[key2], s[key1]
-        self._refresh_seasons_ui()
-        self.dirty_requested.emit(self._series.id)
 
     def _on_eject_season(self, season_key: str):
         season = self._series.seasons.get(season_key)
@@ -615,109 +717,22 @@ class SeriesCard(QFrame):
         if dlg.exec() == QDialog.DialogCode.Accepted and dlg.target_series_name:
             self.absorb_requested.emit(self._series.id, dlg.target_series_name, dlg.season_label)
 
-    def _refresh_seasons_ui(self):
-        """Rebuild season view rows and edit blocks after in-place data mutation."""
-        while self._seasons_layout.count():
-            item = self._seasons_layout.takeAt(0)
-            if w := item.widget():
-                w.setParent(None)
-        self._season_rows = {}
-
-        active = {k: v for k, v in self._series.seasons.items() if not v.p2w}
-        sorted_active = sorted(active.keys(), key=int)
-        for i, sn_str in enumerate(sorted_active):
-            if i > 0:
-                self._seasons_layout.addWidget(_hline())
-            row = SeasonRow(self._series.id, int(sn_str), active[sn_str],
-                            is_first=(i == 0), is_last=(i == len(sorted_active) - 1))
-            row.watch_requested.connect(self.watch_requested)
-            row.complete_requested.connect(self.complete_requested)
-            row.rate_requested.connect(self.rate_requested)
-            row.move_up_requested.connect(lambda sn=int(sn_str): self._reorder_season(sn, up=True))
-            row.move_down_requested.connect(lambda sn=int(sn_str): self._reorder_season(sn, up=False))
-            self._seasons_layout.addWidget(row)
-            self._season_rows[sn_str] = row
-
-        if self._edit_panel is not None:
-            self._season_inputs = {}
-            while self._edit_blocks_layout.count():
-                item = self._edit_blocks_layout.takeAt(0)
-                if w := item.widget():
-                    w.setParent(None)
-            for sn_str in sorted(self._series.seasons.keys(), key=int):
-                block = self._make_season_block(sn_str, self._series.seasons[sn_str])
-                self._edit_blocks_layout.addWidget(block)
-            if hasattr(self, '_absorb_btn'):
-                self._absorb_btn.setVisible(len(self._series.seasons) == 1)
-
-        self._recheck_completed()
-        self._refresh_avg_badge()
-
-    def update_season_rating(self, season_num: int, rating: int):
-        """Refresh the avg badge (rating is persisted via SeasonRow combo)."""
-        self._refresh_avg_badge()
-
-    def _recheck_completed(self):
-        active = {k: v for k, v in self._series.seasons.items() if not v.p2w}
-        has_p2w = any(v.p2w for v in self._series.seasons.values())
-        completed = (
-            bool(active)
-            and not has_p2w
-            and all(v.watched >= v.episodes for v in active.values())
+    def _auto_save(self):
+        self.auto_save_requested.emit(
+            self._series.id,
+            self._name_input.text().strip() or self._series.name,
+            self._kind_selector.value,
+            self._alt_names_parsed(),
+            {},
         )
-        self.setProperty("completed", "true" if completed else "false")
-        self.style().unpolish(self)
-        self.style().polish(self)
-
-    def _refresh_avg_badge(self):
-        active = {k: v for k, v in self._series.seasons.items() if not v.p2w}
-        rated = [v.rating for v in active.values() if v.rating > 0]
-        avg = round(sum(rated) / len(rated)) if rated else None
-        if avg is not None:
-            self._avg_lbl.setText(f"⭐ {avg}")
-            self._avg_lbl.setVisible(True)
-        else:
-            self._avg_lbl.setVisible(False)
-
-    def update_name(self, name: str, alt_names: list[str] = None):
-        self._name_lbl.setText(name)
-        if alt_names is not None:
-            self._altname_lbl.setText("  /  ".join(alt_names))
-            self._altname_lbl.setVisible(bool(alt_names))
 
     def _alt_names_parsed(self) -> list[str]:
         return [n.strip() for n in self._alt_names_input.text().split(",") if n.strip()]
 
-    def _auto_save_name(self):
-        name = self._name_input.text().strip() or self._series.name
-        self.auto_save_requested.emit(
-            self._series.id, name, self._kind_selector.value, self._alt_names_parsed(), {}
-        )
-
-    def apply_watch(self, season_num: int, updated_season: Season):
-        """Replace a SeasonRow in-place and sync the edit panel spinbox."""
-        key = str(season_num)
-        old_row = self._season_rows.get(key)
-        if old_row:
-            idx = self._seasons_layout.indexOf(old_row)
-            self._seasons_layout.removeWidget(old_row)
-            old_row.setParent(None)
-            new_row = SeasonRow(self._series.id, season_num, updated_season)
-            new_row.watch_requested.connect(self.watch_requested)
-            new_row.complete_requested.connect(self.complete_requested)
-            new_row.rate_requested.connect(self.rate_requested)
-            self._seasons_layout.insertWidget(idx, new_row)
-            self._season_rows[key] = new_row
-        self._series.seasons[key] = updated_season
-        inp = self._season_inputs.get(key)
+    def sync_season_watched(self, season_num: int, watched: int):
+        inp = self._season_inputs.get(str(season_num))
         if inp:
-            inp['watched'].setValue(updated_season.watched)
-
-        self._recheck_completed()
-
-    def update_kind_icon(self, kind: str):
-        """Refresh the kind icon label if kind changed without a full rebuild."""
-        pass  # icon label not stored as instance var; full rebuild handles kind changes
+            inp["watched"].setValue(watched)
 
 
 class P2WCard(QFrame):
