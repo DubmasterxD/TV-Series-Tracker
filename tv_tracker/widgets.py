@@ -666,10 +666,8 @@ class P2WCard(QFrame):
 
         outer.addWidget(body)
 
-        # Edit panel (hidden)
-        self._edit_panel = self._build_edit_panel(series)
-        self._edit_panel.setVisible(False)
-        outer.addWidget(self._edit_panel)
+        self._edit_panel = None  # built lazily on first open
+        self._outer_layout = outer
 
     def _build_edit_panel(self, series: Series) -> QFrame:
         panel = QFrame()
@@ -770,6 +768,10 @@ class P2WCard(QFrame):
         return row
 
     def _toggle_edit(self):
+        if self._edit_panel is None:
+            self._edit_panel = self._build_edit_panel(self._series)
+            self._edit_panel.setVisible(False)
+            self._outer_layout.addWidget(self._edit_panel)
         self._edit_panel.setVisible(not self._edit_panel.isVisible())
 
     def _auto_save(self):
@@ -779,6 +781,9 @@ class P2WCard(QFrame):
             for sn_str, inp in self._p2w_season_inputs.items()
         }
         self.auto_save_requested.emit(self._series.id, name, season_edits)
+
+    def update_name(self, name: str):
+        self._name_lbl.setText(name)
 
 
 class SpinWheel(QWidget):

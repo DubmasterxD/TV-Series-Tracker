@@ -255,6 +255,15 @@ class MainWindow(QMainWindow):
                     ("movie", "🎬  MOVIES"), ("horror", "👻  HORROR")]
 
     def _rebuild(self):
+        self._left_content.setUpdatesEnabled(False)
+        self._right_content.setUpdatesEnabled(False)
+        try:
+            self._rebuild_inner()
+        finally:
+            self._left_content.setUpdatesEnabled(True)
+            self._right_content.setUpdatesEnabled(True)
+
+    def _rebuild_inner(self):
         # Clear left column
         while self._list_layout.count():
             item = self._list_layout.takeAt(0)
@@ -458,7 +467,7 @@ class MainWindow(QMainWindow):
             existing.seasons[key] = Season(episodes=episodes, watched=0, rating=0, label=label, p2w=p2w)
             self._tracker._mark_dirty()
             self._schedule_save()
-            self._rebuild()
+            self._insert_or_replace_card(existing)
             self._scroll_to_card(existing.id)
             self._add_form.reset()
             msg = "Season added to Plan to Watch!" if p2w else "Season added!"
@@ -468,11 +477,112 @@ class MainWindow(QMainWindow):
         # New series
         s = self._tracker.add_series(name, season, episodes, 0, kind, p2w, label=label)
         self._schedule_save()
-        self._rebuild()
+        self._insert_or_replace_card(s)
         self._scroll_to_card(s.id)
         self._add_form.reset()
         msg = "Added to Plan to Watch!" if p2w else "Series added!"
         self._toast.show_message(msg)
+
+    def _insert_or_replace_card(self, s):
+        """Insert or replace cards for series s without a full rebuild."""
+        self._left_content.setUpdatesEnabled(False)
+        self._right_content.setUpdatesEnabled(False)
+        try:
+            self._do_insert_or_replace_card(s)
+        finally:
+            self._left_content.setUpdatesEnabled(True)
+            self._right_content.setUpdatesEnabled(True)
+        n = len(self._tracker.series)
+        self.setWindowTitle(f"My Series Tracker{'  —  ' + str(n) + ' series' if n else ''}")
+        self._update_spin_wheel()
+        self._apply_filter()
+
+    def _do_insert_or_replace_card(self, s):
+        has_active = any(not v.p2w for v in s.seasons.values())
+        has_p2w    = any(v.p2w    for v in s.seasons.values())
+
+        # ── Left column ──────────────────────────────────────────
+        old_card = self._cards.pop(s.id, None)
+        if old_card:
+            idx = self._list_layout.indexOf(old_card)
+            self._list_layout.removeWidget(old_card)
+            old_card.setParent(None)
+        else:
+            idx = -1
+
+        if has_active:
+            card = SeriesCard(s)
+            card.watch_requested.connect(self._on_watch)
+            card.delete_requested.connect(self._on_delete)
+            card.auto_save_requested.connect(self._on_auto_save)
+            card.add_season_requested.connect(self._on_add_season)
+            card.complete_requested.connect(self._on_complete)
+            card.rate_requested.connect(self._on_rate)
+            card.season_delete_requested.connect(self._on_delete_season)
+            card.edit_closed.connect(self._on_edit_closed)
+            self._cards[s.id] = card
+
+            if idx >= 0:
+                # Replace in-place at the same position
+                self._list_layout.insertWidget(idx, card)
+            else:
+                # Insert at end of the kind group, creating header if needed
+                insert_idx = self._kind_group_end_index(s.kind)
+                self._list_layout.insertWidget(insert_idx, card)
+
+        # ── Right column (P2W) ───────────────────────────────────
+        old_p2w = self._p2w_cards.pop(s.id, None)
+        if old_p2w:
+            self._p2w_layout.removeWidget(old_p2w)
+            old_p2w.setParent(None)
+
+        if has_p2w:
+            p2w_card = P2WCard(s)
+            p2w_card.p2w_remove_requested.connect(self._on_p2w_remove)
+            p2w_card.delete_requested.connect(self._on_delete)
+            p2w_card.season_delete_requested.connect(self._on_delete_season)
+            p2w_card.auto_save_requested.connect(self._on_p2w_auto_save)
+            self._p2w_layout.addWidget(p2w_card)
+            self._p2w_cards[s.id] = p2w_card
+
+    def _kind_group_end_index(self, kind: str) -> int:
+        """Return the layout index just after the last card of `kind`, creating the section header if absent."""
+        kind_order = [k for k, _ in self._KIND_LABELS]
+        label_map  = {k: lbl for k, lbl in self._KIND_LABELS}
+
+        # Collect cards per kind from current layout state
+        cards_by_kind: dict[str, list[int]] = {k: [] for k in kind_order}
+        for i in range(self._list_layout.count()):
+            w = self._list_layout.itemAt(i).widget()
+            if isinstance(w, SeriesCard):
+                cards_by_kind.get(w._series.kind, []).append(i)
+
+        if cards_by_kind[kind]:
+            # Kind group already exists — insert after its last card
+            return cards_by_kind[kind][-1] + 1
+
+        # Kind group doesn't exist yet — find where it should go based on kind order
+        insert_before = self._list_layout.count()
+        for k in kind_order:
+            if k == kind:
+                break
+            # skip kinds that come before ours
+        for k in kind_order[kind_order.index(kind) + 1:]:
+            if cards_by_kind[k]:
+                # Find the header for this kind and insert before it
+                for i in range(self._list_layout.count()):
+                    w = self._list_layout.itemAt(i).widget()
+                    if w is self._section_headers.get(k):
+                        insert_before = i
+                        break
+                break
+
+        # Create and insert the section header
+        hdr = QLabel(label_map[kind])
+        hdr.setObjectName("list_section_lbl")
+        self._list_layout.insertWidget(insert_before, hdr)
+        self._section_headers[kind] = hdr
+        return insert_before + 1  # card goes right after the new header
 
     def _on_watch(self, series_id: int, season_num: int):
         finished = self._tracker.watch_one(series_id, season_num)
@@ -542,7 +652,9 @@ class MainWindow(QMainWindow):
                 }
         self._tracker.apply_edit(series_id, name, s.kind, s.alt_names, full_edits)
         self._schedule_save()
-        self._rebuild()
+        p2w_card = self._p2w_cards.get(series_id)
+        if p2w_card:
+            p2w_card.update_name(name)
 
     def _on_rate(self, series_id: int, season_num: int, rating: int):
         self._tracker.rate_season(series_id, season_num, rating)
