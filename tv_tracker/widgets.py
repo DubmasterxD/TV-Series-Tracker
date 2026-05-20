@@ -1,7 +1,7 @@
 import math
 import random
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QRectF, QPointF, QSize, QEvent
-from PyQt6.QtGui import QValidator, QPainter, QColor, QPen, QBrush, QFont, QPolygonF
+from PyQt6.QtGui import QValidator, QPainter, QColor, QPen, QBrush, QFont, QPolygonF, QPixmap
 from PyQt6.QtWidgets import (
     QWidget, QFrame, QLabel, QPushButton, QLineEdit, QSpinBox, QComboBox,
     QAbstractSpinBox, QProgressBar, QHBoxLayout, QVBoxLayout, QSizePolicy,
@@ -921,6 +921,12 @@ class SpinWheel(QWidget):
         self._timer = QTimer(self)
         self._timer.setInterval(16)
         self._timer.timeout.connect(self._tick)
+        # Pre-built QColor objects — constant, never reallocated per frame
+        self._qcolors = [QColor(c) for c in self._COLORS]
+        # Cached font metrics; invalidated when items or widget size changes
+        self._font_cache: tuple | None = None   # (n, r, font_size, n_lines, QFont)
+        # Pre-rendered wheel image; rebuild only when items or size change
+        self._wheel_pixmap: QPixmap | None = None
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
     def sizeHint(self)  -> QSize: return QSize(260, 260)
@@ -929,7 +935,14 @@ class SpinWheel(QWidget):
     def set_items(self, items: list[str]):
         self._items = list(items)
         self._result = None
+        self._font_cache = None
+        self._wheel_pixmap = None
         self.update()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._font_cache = None
+        self._wheel_pixmap = None
 
     def is_spinning(self) -> bool:
         return self._timer.isActive()
@@ -966,6 +979,78 @@ class SpinWheel(QWidget):
             if self._result:
                 self.spun.emit(self._result)
 
+    def _build_wheel_pixmap(self) -> QPixmap:
+        """Render all segments, labels, and rim into a cached pixmap at angle=0.
+        paintEvent only needs to rotate + blit this image each frame."""
+        w, h = self.width(), self.height()
+        px = QPixmap(w, h)
+        px.fill(Qt.GlobalColor.transparent)
+
+        p = QPainter(px)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        cx, cy = w / 2.0, h / 2.0
+        r = min(w, h) / 2.0 - 24
+        n = len(self._items)
+        angle_per = 360.0 / n
+        rim_rect = QRectF(cx - r, cy - r, r * 2, r * 2)
+        text_r = r * 0.50
+        radial_span = r * 0.70
+
+        # Font size — compute once and store so the result overlay can reuse it
+        arc_width = text_r * math.radians(angle_per)
+        longest = max(self._items, key=len) if self._items else ""
+        font_size, n_lines = 5, 1
+        for nl in range(1, 5):
+            cpl = math.ceil(len(longest) / nl) if longest else 1
+            fs = int(min(
+                radial_span / max(1.0, cpl * 0.70),
+                arc_width   / max(1.0, nl  * 1.35),
+                16,
+            ))
+            if fs > font_size:
+                font_size, n_lines = fs, nl
+        font_size = max(5, font_size)
+        lbl_font = QFont("Segoe UI", font_size, QFont.Weight.Bold)
+        self._font_cache = (n, r, font_size, n_lines, lbl_font)
+
+        half_span = radial_span / 2
+        fh = font_size * 1.35 * n_lines
+        txt_flags = int(Qt.AlignmentFlag.AlignCenter) | int(Qt.TextFlag.TextWordWrap)
+        seg_pen  = QPen(QColor("#1e2433"), 1)
+        text_pen = QPen(QColor("#0a120e"))
+
+        for i in range(n):
+            # Segment — drawn at angle=0; paintEvent applies rotation via transform
+            qt_start = int((90.0 - i * angle_per) * 16)
+            qt_span  = int(-angle_per * 16)
+            p.setBrush(QBrush(self._qcolors[i % len(self._qcolors)]))
+            p.setPen(seg_pen)
+            p.drawPie(rim_rect, qt_start, qt_span)
+
+            # Text label
+            my_mid   = i * angle_per + angle_per / 2
+            math_rad = math.radians(90.0 - my_mid)
+            tx = cx + text_r * math.cos(math_rad)
+            ty = cy - text_r * math.sin(math_rad)
+            rot = (my_mid - 90) % 360
+            if 90 < rot < 270:
+                rot -= 180
+            p.save()
+            p.translate(tx, ty)
+            p.rotate(rot)
+            p.setFont(lbl_font)
+            p.setPen(text_pen)
+            p.drawText(QRectF(-half_span, -fh / 2, radial_span, fh), txt_flags, self._items[i])
+            p.restore()
+
+        # Rim border
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(QColor("#3a4357"), 2))
+        p.drawEllipse(rim_rect)
+        p.end()
+        return px
+
     def paintEvent(self, _event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -976,8 +1061,7 @@ class SpinWheel(QWidget):
 
         if not self._items:
             painter.setPen(QColor("#5a6480"))
-            f = QFont("Segoe UI", 10)
-            painter.setFont(f)
+            painter.setFont(QFont("Segoe UI", 10))
             painter.drawText(
                 QRectF(0, 0, w, h),
                 Qt.AlignmentFlag.AlignCenter,
@@ -985,85 +1069,29 @@ class SpinWheel(QWidget):
             )
             return
 
-        n         = len(self._items)
-        angle_per = 360.0 / n
-        colors    = [QColor(c) for c in self._COLORS]
-        rim_rect  = QRectF(cx - r, cy - r, r * 2, r * 2)
+        # Rebuild pixmap only when items or size changed — not every frame
+        if self._wheel_pixmap is None or self._wheel_pixmap.width() != w or self._wheel_pixmap.height() != h:
+            self._wheel_pixmap = self._build_wheel_pixmap()
 
-        for i in range(n):
-            my_start = self._angle + i * angle_per
-            qt_start = int((90.0 - my_start) * 16)
-            qt_span  = int(-angle_per * 16)
+        # Single rotated blit replaces all per-frame segment + text draw calls
+        painter.save()
+        painter.translate(cx, cy)
+        painter.rotate(self._angle)
+        painter.translate(-cx, -cy)
+        painter.drawPixmap(0, 0, self._wheel_pixmap)
+        painter.restore()
 
-            painter.setBrush(QBrush(colors[i % len(colors)]))
-            painter.setPen(QPen(QColor("#1e2433"), 1))
-            painter.drawPie(rim_rect, qt_start, qt_span)
-
-        # ── Radial text sizing ────────────────────────────────────
-        # Text centre at mid-radius; rect spans hub → near-rim along the spoke.
-        text_r      = r * 0.50
-        radial_span = r * 0.70
-
-        # Perpendicular gap between neighbouring segment boundaries at text_r
-        arc_width = text_r * math.radians(angle_per)
-
-        # Find the largest font size that fits the longest name, trying 1-4 lines.
-        # Two constraints per attempt:
-        #   width  → font_size ≤ radial_span / (chars_per_line × avg_char_width)
-        #   height → font_size ≤ arc_width   / (n_lines × line_height_ratio)
-        longest   = max(self._items, key=len) if self._items else ""
-        font_size = 5
-        n_lines   = 1
-        for nl in range(1, 5):
-            cpl = math.ceil(len(longest) / nl) if longest else 1
-            fs  = int(min(
-                radial_span / max(1.0, cpl * 0.70),   # width constraint (avg char ≈ 0.70×pt)
-                arc_width   / max(1.0, nl  * 1.35),   # height constraint (line ≈ 1.35×pt)
-                16,                                     # absolute cap
-            ))
-            if fs > font_size:
-                font_size, n_lines = fs, nl
-
-        font_size = max(5, font_size)
-        lbl_font  = QFont("Segoe UI", font_size, QFont.Weight.Bold)
-        half_span = radial_span / 2
-        fh        = font_size * 1.35 * n_lines   # total rect height in px
-
-        # AlignCenter | TextWordWrap — Qt wraps on spaces automatically
-        txt_flags = int(Qt.AlignmentFlag.AlignCenter) | int(Qt.TextFlag.TextWordWrap)
-
-        for i, name in enumerate(self._items):
-            my_mid   = self._angle + i * angle_per + angle_per / 2
-            math_rad = math.radians(90.0 - my_mid)
-            tx = cx + text_r * math.cos(math_rad)
-            ty = cy - text_r * math.sin(math_rad)
-
-            # Radial rotation: painter X-axis aligned with the outward spoke direction
-            rot = (my_mid - 90) % 360
-            if 90 < rot < 270:
-                rot -= 180   # flip left-half spokes so text reads naturally from outside
-
-            painter.save()
-            painter.translate(tx, ty)
-            painter.rotate(rot)
-            painter.setFont(lbl_font)
-            painter.setPen(QColor("#0a120e"))
-            painter.drawText(QRectF(-half_span, -fh / 2, radial_span, fh), txt_flags, name)
-            painter.restore()
-
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.setPen(QPen(QColor("#3a4357"), 2))
-        painter.drawEllipse(rim_rect)
-
+        # Hub (centered — not part of the rotating wheel)
         hub_r = max(10.0, r * 0.11)
         painter.setBrush(QBrush(QColor("#1e2433")))
         painter.setPen(QPen(QColor("#3a4357"), 2))
         painter.drawEllipse(QPointF(cx, cy), hub_r, hub_r)
 
+        # Pointer triangle (fixed at top)
         ptr_tip_y = cy - r - 4
         ptr_h, ptr_w = 14, 9
         triangle = QPolygonF([
-            QPointF(cx,           ptr_tip_y + ptr_h),
+            QPointF(cx,          ptr_tip_y + ptr_h),
             QPointF(cx - ptr_w,  ptr_tip_y),
             QPointF(cx + ptr_w,  ptr_tip_y),
         ])
@@ -1072,13 +1100,13 @@ class SpinWheel(QWidget):
         painter.drawPolygon(triangle)
 
         if self._result and not self._timer.isActive():
+            _, _, font_size, _, _ = self._font_cache
             flash_r = r * 0.38
             painter.setBrush(QBrush(QColor(30, 36, 51, 210)))
             painter.setPen(Qt.PenStyle.NoPen)
             painter.drawEllipse(QPointF(cx, cy), flash_r, flash_r)
             painter.setPen(QColor("#2dd4a0"))
-            f2 = QFont("Segoe UI", max(8, font_size + 1), QFont.Weight.Bold)
-            painter.setFont(f2)
+            painter.setFont(QFont("Segoe UI", max(8, font_size + 1), QFont.Weight.Bold))
             painter.drawText(
                 QRectF(cx - flash_r, cy - flash_r, flash_r * 2, flash_r * 2),
                 Qt.AlignmentFlag.AlignCenter,
