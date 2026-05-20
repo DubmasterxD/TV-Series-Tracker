@@ -5,6 +5,7 @@ from PyQt6.QtGui import QValidator, QPainter, QColor, QPen, QBrush, QFont, QPoly
 from PyQt6.QtWidgets import (
     QWidget, QFrame, QLabel, QPushButton, QLineEdit, QSpinBox, QComboBox,
     QAbstractSpinBox, QProgressBar, QHBoxLayout, QVBoxLayout, QSizePolicy,
+    QDialog, QRadioButton, QGroupBox, QFileDialog,
 )
 from models import Series, Season
 
@@ -1101,3 +1102,58 @@ class Toast(QLabel):
             pw = self.parent().width()
             ph = self.parent().height()
             self.move(pw - self.width() - 20, ph - self.height() - 24)
+
+
+class MALImportDialog(QDialog):
+    import_requested = pyqtSignal(str, bool)  # (file_path, group_mode)
+
+    def __init__(self, parent: QWidget = None):
+        super().__init__(parent)
+        self.setWindowTitle("Import from MyAnimeList")
+        self.setModal(True)
+        self.setMinimumWidth(420)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+        layout.setContentsMargins(20, 20, 20, 20)
+
+        layout.addWidget(QLabel("MyAnimeList XML file:"))
+
+        file_row = QHBoxLayout()
+        self._path_edit = QLineEdit()
+        self._path_edit.setReadOnly(True)
+        self._path_edit.setPlaceholderText("No file selected…")
+        browse_btn = QPushButton("Browse…")
+        browse_btn.clicked.connect(self._browse)
+        file_row.addWidget(self._path_edit, 1)
+        file_row.addWidget(browse_btn)
+        layout.addLayout(file_row)
+
+        mode_box = QGroupBox("Import mode")
+        mode_layout = QVBoxLayout(mode_box)
+        self._group_radio = QRadioButton("Group series (combine seasons)")
+        self._group_radio.setChecked(True)
+        no_group_radio = QRadioButton("Don't group (import as separate series)")
+        mode_layout.addWidget(self._group_radio)
+        mode_layout.addWidget(no_group_radio)
+        layout.addWidget(mode_box)
+
+        self._import_btn = QPushButton("Import")
+        self._import_btn.setObjectName("btn_add")
+        self._import_btn.setEnabled(False)
+        self._import_btn.clicked.connect(self._on_import)
+        layout.addWidget(self._import_btn)
+
+    def _browse(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open MAL XML export", "", "MAL XML (*.xml);;All Files (*)"
+        )
+        if path:
+            self._path_edit.setText(path)
+            self._import_btn.setEnabled(True)
+
+    def _on_import(self):
+        path = self._path_edit.text()
+        if path:
+            self.import_requested.emit(path, self._group_radio.isChecked())
+            self.accept()

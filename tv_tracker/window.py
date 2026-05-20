@@ -4,10 +4,10 @@ from datetime import datetime
 from PyQt6.QtCore import Qt, QTimer, QMetaObject, pyqtSlot
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QScrollArea,
-    QLabel, QLineEdit, QPushButton, QStatusBar, QSizePolicy,
+    QLabel, QLineEdit, QPushButton, QStatusBar, QSizePolicy, QMessageBox,
 )
-from models import Season, Tracker
-from widgets import AddForm, SeriesCard, P2WCard, SpinWheel, Toast
+from models import Season, Series, Tracker
+from widgets import AddForm, SeriesCard, P2WCard, SpinWheel, Toast, MALImportDialog
 
 
 class MainWindow(QMainWindow):
@@ -57,6 +57,12 @@ class MainWindow(QMainWindow):
         self._add_form = AddForm()
         self._add_form.add_requested.connect(self._on_add)
         lt.addWidget(self._add_form)
+
+        self._import_mal_btn = QPushButton("⬆  Import MAL")
+        self._import_mal_btn.setObjectName("kind_btn")
+        self._import_mal_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._import_mal_btn.clicked.connect(self._on_import_mal)
+        lt.addWidget(self._import_mal_btn)
 
         self._search = QLineEdit()
         self._search.setPlaceholderText("🔍  Search by name…")
@@ -773,6 +779,54 @@ class MainWindow(QMainWindow):
 
     def _on_edit_closed(self, series_id: int):
         self._scroll_to_card(series_id)
+
+    def _on_import_mal(self):
+        dlg = MALImportDialog(self)
+        dlg.import_requested.connect(self._run_mal_import)
+        dlg.exec()
+
+    def _run_mal_import(self, path: str, group: bool):
+        from mal_import import parse_mal_xml, build_series_grouped, build_series_ungrouped
+        try:
+            entries = parse_mal_xml(path)
+        except Exception as e:
+            QMessageBox.critical(self, "Import Error", f"Failed to parse XML:\n{e}")
+            return
+
+        series_list = build_series_grouped(entries) if group else build_series_ungrouped(entries)
+
+        skipped: list[str] = []
+        added = 0
+        base_id = int(time.time() * 1000)
+        for i, (name, seasons) in enumerate(series_list):
+            if self._tracker.find_by_name(name):
+                skipped.append(name)
+                continue
+            s = Series(id=base_id + i, name=name, kind="anime", seasons=seasons)
+            self._tracker._id_index[s.id] = s
+            self._tracker.series.append(s)
+            added += 1
+
+        if added:
+            self._tracker._is_sorted = False
+            self._tracker._mark_dirty()
+            self._tracker.flush_now()
+            self._rebuild()
+            self._set_status(self._saved_msg())
+
+        if skipped:
+            names = ", ".join(skipped[:10])
+            if len(skipped) > 10:
+                names += f"  (+{len(skipped) - 10} more)"
+            QMessageBox.information(
+                self, "Import Complete",
+                f"Imported {added} series.\n"
+                f"Skipped {len(skipped)} duplicate{'s' if len(skipped) != 1 else ''}: {names}",
+            )
+        elif added:
+            self._toast.show_message(f"Imported {added} series!")
+        else:
+            self._toast.show_message("Nothing imported — all entries already exist.")
 
     def _saved_msg(self) -> str:
         n = len(self._tracker.series)
