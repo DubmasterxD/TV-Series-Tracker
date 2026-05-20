@@ -370,6 +370,26 @@ QPushButton#btn_spin:hover   {{ background: #4a3010; }}
 QPushButton#btn_spin:pressed {{ background: {AMBER_DIM}; }}
 QPushButton#btn_spin:disabled {{ color: {HINT}; border-color: {BORDER}; background: {SURFACE}; }}
 
+/* ── Reorder arrows (small, neutral) ── */
+QPushButton#btn_reorder {{
+    background: {SURFACE2}; color: {MUTED};
+    border: 1px solid {BORDER};
+    border-radius: 4px; padding: 2px 3px;
+    font-size: 10px; font-weight: 500;
+}}
+QPushButton#btn_reorder:hover {{ color: {TEXT}; border-color: {MUTED}; }}
+QPushButton#btn_reorder:disabled {{ color: {SURFACE2}; border-color: {SURFACE2}; background: {SURFACE}; }}
+
+/* ── Eject (extract season) button — small, amber-tinted ── */
+QPushButton#btn_eject {{
+    background: {AMBER_BG}; color: {AMBER};
+    border: 1px solid {AMBER_DIM};
+    border-radius: 4px; padding: 2px 6px;
+    font-size: 11px; font-weight: 600;
+}}
+QPushButton#btn_eject:hover {{ background: #4a3010; }}
+QPushButton#btn_eject:pressed {{ background: {AMBER_DIM}; }}
+
 /* ── CheckBox ── */
 QCheckBox {{ color: {PURPLE}; font-size: 12px; font-weight: 500; spacing: 6px; }}
 QCheckBox::indicator {{

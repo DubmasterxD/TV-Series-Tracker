@@ -303,6 +303,9 @@ class MainWindow(QMainWindow):
                     card.rate_requested.connect(self._on_rate)
                     card.season_delete_requested.connect(self._on_delete_season)
                     card.edit_closed.connect(self._on_edit_closed)
+                    card.dirty_requested.connect(self._on_season_dirty)
+                    card.eject_season_requested.connect(self._on_eject_season)
+                    card.absorb_requested.connect(self._on_absorb)
                     self._list_layout.addWidget(card)
                     self._cards[s.id] = card
                 elif item[0] == 'right':
@@ -386,6 +389,9 @@ class MainWindow(QMainWindow):
                 card.rate_requested.connect(self._on_rate)
                 card.season_delete_requested.connect(self._on_delete_season)
                 card.edit_closed.connect(self._on_edit_closed)
+                card.dirty_requested.connect(self._on_season_dirty)
+                card.eject_season_requested.connect(self._on_eject_season)
+                card.absorb_requested.connect(self._on_absorb)
                 self._list_layout.addWidget(card)
                 self._cards[s.id] = card
 
@@ -598,6 +604,9 @@ class MainWindow(QMainWindow):
             card.rate_requested.connect(self._on_rate)
             card.season_delete_requested.connect(self._on_delete_season)
             card.edit_closed.connect(self._on_edit_closed)
+            card.dirty_requested.connect(self._on_season_dirty)
+            card.eject_season_requested.connect(self._on_eject_season)
+            card.absorb_requested.connect(self._on_absorb)
             self._cards[s.id] = card
 
             if idx >= 0:
@@ -779,6 +788,90 @@ class MainWindow(QMainWindow):
 
     def _on_edit_closed(self, series_id: int):
         self._scroll_to_card(series_id)
+
+    def _on_season_dirty(self, series_id: int):
+        self._tracker._mark_dirty()
+        self._schedule_save()
+
+    def _on_eject_season(self, series_id: int, season_key: str, new_name: str):
+        s = self._tracker._find(series_id)
+        if not s:
+            return
+        original_kind = s.kind
+        season = s.seasons.pop(season_key, None)
+        if season is None:
+            return
+        sorted_remaining = sorted(s.seasons.keys(), key=int)
+        s.seasons = {str(i + 1): s.seasons[k] for i, k in enumerate(sorted_remaining)}
+
+        new_series = Series(
+            id=int(time.time() * 1000),
+            name=new_name,
+            kind=original_kind,
+            seasons={"1": Season(
+                episodes=season.episodes, watched=season.watched,
+                rating=season.rating, label=season.label, p2w=season.p2w,
+            )},
+        )
+        self._tracker._id_index[new_series.id] = new_series
+        self._tracker.series.append(new_series)
+        self._tracker._is_sorted = False
+        self._tracker._mark_dirty()
+
+        if s.seasons:
+            self._insert_or_replace_card(s)
+        else:
+            self._tracker.delete_series(series_id)
+            for cards, layout in ((self._cards, self._list_layout),
+                                  (self._p2w_cards, self._p2w_layout)):
+                card = cards.pop(series_id, None)
+                if card:
+                    layout.removeWidget(card)
+                    card.setParent(None)
+
+        self._insert_or_replace_card(new_series)
+        self._schedule_save()
+        self._toast.show_message(f'"{new_name}" created!')
+
+    def _on_absorb(self, series_id: int, target_name: str, new_label: str):
+        src = self._tracker._find(series_id)
+        if not src or len(src.seasons) != 1:
+            return
+        season_data = next(iter(src.seasons.values()))
+
+        target = self._tracker.find_by_name(target_name)
+        if target:
+            next_key = str(max(int(k) for k in target.seasons) + 1) if target.seasons else "1"
+            target.seasons[next_key] = Season(
+                episodes=season_data.episodes, watched=season_data.watched,
+                rating=season_data.rating, label=new_label, p2w=season_data.p2w,
+            )
+        else:
+            target = Series(
+                id=int(time.time() * 1000),
+                name=target_name,
+                kind=src.kind,
+                seasons={"1": Season(
+                    episodes=season_data.episodes, watched=season_data.watched,
+                    rating=season_data.rating, label=new_label, p2w=season_data.p2w,
+                )},
+            )
+            self._tracker._id_index[target.id] = target
+            self._tracker.series.append(target)
+            self._tracker._is_sorted = False
+
+        self._tracker.delete_series(series_id)
+        for cards, layout in ((self._cards, self._list_layout),
+                              (self._p2w_cards, self._p2w_layout)):
+            card = cards.pop(series_id, None)
+            if card:
+                layout.removeWidget(card)
+                card.setParent(None)
+
+        self._tracker._mark_dirty()
+        self._insert_or_replace_card(target)
+        self._schedule_save()
+        self._toast.show_message(f'Merged into "{target_name}"!')
 
     def _on_import_mal(self):
         dlg = MALImportDialog(self)
