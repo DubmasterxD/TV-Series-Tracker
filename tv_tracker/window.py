@@ -1,3 +1,4 @@
+import bisect
 import threading
 import time
 from datetime import datetime
@@ -15,32 +16,42 @@ class MainWindow(QMainWindow):
         super().__init__()
         self._tracker = Tracker()
         self._toast: Toast = None
-        self._cards: dict[int, SeriesCard] = {}
+        self._cards: dict[int, SeriesCard] = {}   # series_id → pool card (currently visible)
         self._p2w_cards: dict[int, P2WCard] = {}
-        self._section_headers: dict[str, QLabel] = {}
         self._kind_filter: str | None = None
         self._filter_btns: dict[str, QPushButton] = {}
         self._spin_result_name: str | None = None
         self._load_result: tuple | None = None
         self._edit_dialogs: dict[int, SeriesEditDialog] = {}
 
-        # Lazy loader:
-        #   _left_pending    — raw data items not yet turned into widgets
-        #   _prebuilt_queue  — widgets built off-layout, shown only on scroll
-        self._left_pending: list = []
-        self._prebuilt_queue: list = []
+        # ── Virtual recycling list ──────────────────────────────────
+        # Exactly POOL_SIZE SeriesCard widgets are kept alive at all times.
+        # _virt_items  — the currently-filtered ordered list of Series objects.
+        # _virt_start  — index into _virt_items of the first pool card.
+        # _virt_prefix — prefix-sum of card heights: _virt_prefix[i] is the
+        #                total pixel height of items 0 … i-1.  Used to position
+        #                the top/bottom spacers so the scrollbar reflects the
+        #                true total content height without rendering every card.
+        self._POOL_SIZE        = 16
+        self._virt_items: list = []
+        self._virt_start: int  = 0
+        self._virt_prefix: list[int] = []
+        self._pool: list[SeriesCard] = []
+        self._top_spacer: QWidget | None = None
+        self._bot_spacer: QWidget | None = None
         self._scroll_connected = False
-
-        # interval=0 fires when the event loop is idle (after all input/paint events)
-        self._bg_build_timer = QTimer(self)
-        self._bg_build_timer.setInterval(0)
-        self._bg_build_timer.timeout.connect(self._bg_build_tick)
 
         # Deferred save: mutations mark dirty; timer batches the actual disk write
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(2000)   # 2 s debounce
         self._save_timer.timeout.connect(self._on_debounce)
+
+        # Debounce search input: rebuild the list only after the user pauses typing
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(250)
+        self._search_timer.timeout.connect(self._apply_filter)
 
         self._setup_ui()
         self._load()
@@ -79,7 +90,7 @@ class MainWindow(QMainWindow):
         self._search = QLineEdit()
         self._search.setPlaceholderText("🔍  Search by name…")
         self._search.setVisible(False)
-        self._search.textChanged.connect(self._apply_filter)
+        self._search.textChanged.connect(lambda _: self._search_timer.start())
         lt.addWidget(self._search)
 
         filter_row = QWidget()
@@ -295,109 +306,245 @@ class MainWindow(QMainWindow):
         finally:
             self._right_content.setUpdatesEnabled(True)
 
-        # Populate the data queue for the left column
-        for kind, label_text in self._KIND_LABELS:
-            group = [s for s in self._tracker.series
-                     if s.kind == kind and any(not v.p2w for v in s.seasons.values())]
-            if group:
-                self._left_pending.append(('header', kind, label_text))
-                for s in group:
-                    self._left_pending.append(('left', s))
-
-        # Flush the first batch straight to the layout — user sees content immediately
-        self._flush_pending_to_layout(20)
+        # Left column — virtual recycling list
         self._apply_filter()
 
         n_total = len(self._tracker.series)
         self.setWindowTitle(f"My Series Tracker{'  —  ' + str(n_total) + ' series' if n_total else ''}")
         self._update_spin_wheel()
 
-        if self._left_pending:
-            self._bg_build_timer.start()
+        # Connect scroll handler (kept connected permanently; handler is a no-op
+        # when fewer than POOL_SIZE items are loaded)
+        if not self._scroll_connected:
             self._left_scroll.verticalScrollBar().valueChanged.connect(self._on_left_scroll)
             self._scroll_connected = True
-        elif result == "ok":
+
+        if result == "ok":
             self._set_status(f"Auto-loaded {n} record{'s' if n != 1 else ''} from storage")
 
-    # ── Two-queue lazy loader ────────────────────────────────────
+    # ── Virtual recycling list ───────────────────────────────────
 
-    def _flush_pending_to_layout(self, count=None):
-        """Build items from _left_pending directly into the layout (used for the initial batch)."""
-        added = 0
-        while self._left_pending:
-            if count is not None and added >= count:
-                break
-            item = self._left_pending.pop(0)
-            if item[0] == 'header':
-                _, kind, label_text = item
-                hdr = QLabel(label_text)
-                hdr.setObjectName("list_section_lbl")
-                self._list_layout.addWidget(hdr)
-                self._section_headers[kind] = hdr
-            else:
-                _, s = item
-                card = self._make_left_card(s)
-                self._list_layout.addWidget(card)
-                self._cards[s.id] = card
-                added += 1
+    def _card_height(self, series) -> int:
+        """Estimated pixel height of a SeriesCard (includes the 10 px layout spacing)."""
+        active = sum(1 for v in series.seasons.values() if not v.p2w)
+        # Header ≈ 50 px; each season row (with hline) ≈ 48 px; body bottom ≈ 12 px
+        return max(80, 50 + active * 48 + 12) + 10
 
-    def _bg_build_tick(self):
-        """Build exactly one item per idle tick — maximum blocking is one cheap card (~0.5 ms)."""
-        if not self._left_pending:
-            self._bg_build_timer.stop()
+    def _build_virt_items(self):
+        """Rebuild the ordered, filtered list of Series for the left column."""
+        query      = self._search.text().strip().lower()
+        kind_order = {k: i for i, (k, _) in enumerate(self._KIND_LABELS)}
+        items      = []
+        for s in self._tracker.series:
+            if not any(not v.p2w for v in s.seasons.values()):
+                continue
+            if self._kind_filter and s.kind != self._kind_filter:
+                continue
+            if query and not (query in s.name.lower() or
+                              any(query in a.lower() for a in s.alt_names)):
+                continue
+            items.append(s)
+        # Stable sort keeps tracker ordering within each kind group.
+        items.sort(key=lambda s: kind_order.get(s.kind, 999))
+        self._virt_items = items
+
+    def _build_virt_prefix(self):
+        """Build the prefix-sum table from _virt_items heights."""
+        prefix = [0]
+        for s in self._virt_items:
+            prefix.append(prefix[-1] + self._card_height(s))
+        self._virt_prefix = prefix
+
+    def _update_spacers(self):
+        """Resize top/bottom spacers so the scrollbar reflects total content height."""
+        N = len(self._virt_items)
+        pool_size = len(self._pool)
+        top_h = self._virt_prefix[self._virt_start] if self._virt_prefix else 0
+        end_idx = min(self._virt_start + pool_size, N)
+        bot_h = (self._virt_prefix[N] - self._virt_prefix[end_idx]) if self._virt_prefix else 0
+        if self._top_spacer:
+            self._top_spacer.setFixedHeight(max(0, top_h))
+        if self._bot_spacer:
+            self._bot_spacer.setFixedHeight(max(0, bot_h))
+
+    def _clear_pool_from_layout(self):
+        """Remove the pool cards and spacers from _list_layout (does not destroy them)."""
+        if self._top_spacer:
+            self._list_layout.removeWidget(self._top_spacer)
+            self._top_spacer.hide()
+        for card in self._pool:
+            self._list_layout.removeWidget(card)
+            card.hide()
+        if self._bot_spacer:
+            self._list_layout.removeWidget(self._bot_spacer)
+            self._bot_spacer.hide()
+        self._cards = {}
+
+    def _setup_virt_list(self):
+        """(Re)populate the layout from _virt_items at the current _virt_start.
+
+        Reuses existing pool cards by calling refresh() on them; creates new
+        ones only when the pool needs to grow.  Excess cards are destroyed.
+        """
+        N = len(self._virt_items)
+        target = min(self._POOL_SIZE, N)
+
+        # Remove everything from layout (hide, don't destroy)
+        self._clear_pool_from_layout()
+
+        # Clamp virt_start so it never goes out of bounds
+        self._virt_start = max(0, min(self._virt_start, max(0, N - target)))
+
+        if N == 0:
+            # Shrink pool completely; empty label will be shown by caller
+            while self._pool:
+                self._pool.pop().setParent(None)
             return
-        item = self._left_pending.pop(0)
-        if item[0] == 'header':
-            _, kind, label_text = item
-            hdr = QLabel(label_text)
-            hdr.setObjectName("list_section_lbl")
-            self._prebuilt_queue.append(('header', kind, hdr))
-        else:
-            _, s = item
-            card = self._make_left_card(s)
-            self._prebuilt_queue.append(('left', s.id, card))
+
+        # Ensure spacer widgets exist (created once, never destroyed)
+        if self._top_spacer is None:
+            self._top_spacer = QWidget()
+            self._top_spacer.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        if self._bot_spacer is None:
+            self._bot_spacer = QWidget()
+            self._bot_spacer.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+
+        # Shrink pool if needed
+        while len(self._pool) > target:
+            self._pool.pop().setParent(None)
+
+        # Refresh existing cards / create new ones
+        for i in range(target):
+            s = self._virt_items[self._virt_start + i]
+            if i < len(self._pool):
+                self._pool[i].refresh(s)
+            else:
+                self._pool.append(self._make_left_card(s))
+            self._cards[s.id] = self._pool[i]
+
+        # Re-add to layout: top_spacer → cards → bot_spacer
+        self._list_container.setUpdatesEnabled(False)
+        try:
+            self._list_layout.addWidget(self._top_spacer)
+            self._top_spacer.show()
+            for card in self._pool:
+                self._list_layout.addWidget(card)
+                card.show()
+            self._list_layout.addWidget(self._bot_spacer)
+            self._bot_spacer.show()
+            self._update_spacers()
+        finally:
+            self._list_container.setUpdatesEnabled(True)
+
+    def _recycle_forward(self):
+        """Move the topmost pool card to the bottom, advancing the visible window."""
+        N = len(self._virt_items)
+        pool_size = len(self._pool)
+        next_idx = self._virt_start + pool_size
+        if next_idx >= N:
+            return
+
+        self._list_container.setUpdatesEnabled(False)
+        try:
+            # Unmap old series
+            old_s = self._virt_items[self._virt_start]
+            self._cards.pop(old_s.id, None)
+
+            card = self._pool[0]
+
+            # Remove from layout (top card is always at layout index 1, right after top_spacer)
+            self._list_layout.removeWidget(card)
+
+            # Refresh with the next series below the current window
+            new_s = self._virt_items[next_idx]
+            card.refresh(new_s)
+            self._cards[new_s.id] = card
+
+            # Re-insert just before bot_spacer (last item in layout)
+            self._list_layout.insertWidget(self._list_layout.count() - 1, card)
+
+            # Rotate pool list so pool[0] is now the new bottom card
+            self._pool.append(self._pool.pop(0))
+
+            self._virt_start += 1
+            self._update_spacers()
+        finally:
+            self._list_container.setUpdatesEnabled(True)
+
+    def _recycle_backward(self):
+        """Move the bottommost pool card to the top, retreating the visible window."""
+        if self._virt_start <= 0:
+            return
+
+        self._list_container.setUpdatesEnabled(False)
+        try:
+            pool_size = len(self._pool)
+
+            # Unmap old series
+            old_s = self._virt_items[self._virt_start + pool_size - 1]
+            self._cards.pop(old_s.id, None)
+
+            card = self._pool[-1]
+
+            # Remove from layout
+            self._list_layout.removeWidget(card)
+
+            # Refresh with the series just above the current window
+            new_s = self._virt_items[self._virt_start - 1]
+            card.refresh(new_s)
+            self._cards[new_s.id] = card
+
+            # Re-insert just after top_spacer (layout index 1)
+            self._list_layout.insertWidget(1, card)
+
+            # Rotate pool list so the recycled card is pool[0]
+            self._pool.insert(0, self._pool.pop(-1))
+
+            self._virt_start -= 1
+            self._update_spacers()
+        finally:
+            self._list_container.setUpdatesEnabled(True)
 
     def _on_left_scroll(self, value: int):
-        """Flush pre-built cards into the layout as the user scrolls toward the bottom."""
-        if not self._prebuilt_queue:
+        """Recycle pool cards as the user scrolls through the virtual list.
+
+        Uses binary search on the prefix-sum table (O(log N)) then measures
+        how many items the viewport actually shows so the pool window covers
+        the entire visible area with equal buffer cards above and below.
+        """
+        N = len(self._virt_items)
+        pool_size = len(self._pool)
+        if pool_size < 2 or N <= pool_size:
+            return   # not enough items to need recycling
+
+        viewport_h = self._left_scroll.viewport().height()
+
+        # Binary search: which items sit at the top and bottom of the viewport?
+        top_idx = max(0, bisect.bisect_right(self._virt_prefix, value) - 1)
+        bot_idx = max(0, bisect.bisect_right(self._virt_prefix, value + viewport_h) - 1)
+
+        # Distribute spare pool slots as equal buffers above and below visible area.
+        visible   = bot_idx - top_idx + 1
+        spare     = max(0, pool_size - visible)
+        buf_above = spare // 2
+        target    = max(0, min(top_idx - buf_above, N - pool_size))
+        delta     = target - self._virt_start
+
+        if delta == 0:
             return
-        sb = self._left_scroll.verticalScrollBar()
-        if sb.maximum() > 0 and value >= sb.maximum() - 400:
-            self._flush_prebuilt_to_layout(10)
 
-    def _flush_prebuilt_to_layout(self, count=None):
-        """Move pre-built widgets from the queue into the layout, applying current filter."""
-        flushed = 0
-        query = self._search.text().strip().lower()
-        while self._prebuilt_queue:
-            if count is not None and flushed >= count:
-                break
-            item = self._prebuilt_queue.pop(0)
-            if item[0] == 'header':
-                _, kind, hdr = item
-                if any(s.kind == kind and any(not v.p2w for v in s.seasons.values())
-                       for s in self._tracker.series):
-                    self._list_layout.addWidget(hdr)
-                    self._section_headers[kind] = hdr
+        if abs(delta) >= pool_size:
+            # Large jump (e.g. dragging scrollbar to end): jump straight to the
+            # target position and rebuild the entire pool in one batched shot.
+            self._virt_start = target
+            self._setup_virt_list()
+        else:
+            # Small incremental move: recycle one card at a time.
+            for _ in range(abs(delta)):
+                if delta > 0:
+                    self._recycle_forward()
                 else:
-                    hdr.setParent(None)
-            else:
-                _, sid, card = item
-                s = self._tracker._find(sid)
-                if s and any(not v.p2w for v in s.seasons.values()):
-                    self._list_layout.addWidget(card)
-                    self._cards[sid] = card
-                    kind_ok = self._kind_filter is None or s.kind == self._kind_filter
-                    name_ok = not query or query in s.name.lower() or any(query in a.lower() for a in s.alt_names)
-                    card.setVisible(kind_ok and name_ok)
-                    flushed += 1
-                else:
-                    card.setParent(None)
-
-        if not self._prebuilt_queue and not self._left_pending and self._load_result:
-            result, n = self._load_result
-            if result == "ok":
-                self._set_status(f"Auto-loaded {n} record{'s' if n != 1 else ''} from storage")
+                    self._recycle_backward()
 
     def _make_left_card(self, s) -> SeriesCard:
         card = SeriesCard(s)
@@ -405,7 +552,6 @@ class MainWindow(QMainWindow):
         card.delete_requested.connect(self._on_delete)
         card.complete_requested.connect(self._on_complete)
         card.rate_requested.connect(self._on_rate)
-        card.dirty_requested.connect(self._on_season_dirty)
         card.edit_requested.connect(self._on_edit_requested)
         return card
 
@@ -421,78 +567,59 @@ class MainWindow(QMainWindow):
                     ("movie", "🎬  MOVIES"), ("horror", "👻  HORROR")]
 
     def _rebuild(self):
-        self._left_content.setUpdatesEnabled(False)
+        self._clear_both_columns()
         self._right_content.setUpdatesEnabled(False)
         try:
-            self._rebuild_inner()
+            for s in self._tracker.series:
+                if any(v.p2w for v in s.seasons.values()):
+                    card = self._make_p2w_card(s)
+                    self._p2w_layout.addWidget(card)
+                    self._p2w_cards[s.id] = card
         finally:
-            self._left_content.setUpdatesEnabled(True)
             self._right_content.setUpdatesEnabled(True)
+        self._apply_filter()
+        n = len(self._tracker.series)
+        self.setWindowTitle(f"My Series Tracker{'  —  ' + str(n) + ' series' if n else ''}")
+        self._update_spin_wheel()
 
     def _clear_both_columns(self):
-        self._left_pending.clear()
-        self._bg_build_timer.stop()
-        for item in self._prebuilt_queue:
-            item[-1].setParent(None)
-        self._prebuilt_queue.clear()
-        if self._scroll_connected:
-            self._left_scroll.verticalScrollBar().valueChanged.disconnect(self._on_left_scroll)
-            self._scroll_connected = False
+        # Destroy all pool cards (and spacers)
+        self._clear_pool_from_layout()
+        while self._pool:
+            self._pool.pop().setParent(None)
+        for spc in (self._top_spacer, self._bot_spacer):
+            if spc:
+                spc.setParent(None)
+        self._top_spacer = None
+        self._bot_spacer = None
+
+        # Clear any leftover layout items (e.g. from an old rebuild)
         while self._list_layout.count():
             item = self._list_layout.takeAt(0)
             if item.widget():
-                w = item.widget()
-                w.hide()
-                w.setParent(None)
+                item.widget().setParent(None)
+
         while self._p2w_layout.count():
             item = self._p2w_layout.takeAt(0)
             if item.widget():
                 w = item.widget()
                 w.hide()
                 w.setParent(None)
+
         self._cards = {}
         self._p2w_cards = {}
-        self._section_headers = {}
-
-    def _rebuild_inner(self):
-        self._clear_both_columns()
-
-        by_kind = {k: [s for s in self._tracker.series if s.kind == k]
-                   for k, _ in self._KIND_LABELS}
-
-        # Left: series with ≥1 non-P2W season
-        for kind, label_text in self._KIND_LABELS:
-            group = [s for s in by_kind[kind]
-                     if any(not v.p2w for v in s.seasons.values())]
-            if not group:
-                continue
-            hdr = QLabel(label_text)
-            hdr.setObjectName("list_section_lbl")
-            self._list_layout.addWidget(hdr)
-            self._section_headers[kind] = hdr
-
-            for s in group:
-                card = self._make_left_card(s)
-                self._list_layout.addWidget(card)
-                self._cards[s.id] = card
-
-        # Right: series with ≥1 P2W season
-        for s in self._tracker.series:
-            if any(v.p2w for v in s.seasons.values()):
-                p2w_card = self._make_p2w_card(s)
-                self._p2w_layout.addWidget(p2w_card)
-                self._p2w_cards[s.id] = p2w_card
-
-        n = len(self._tracker.series)
-        self.setWindowTitle(f"My Series Tracker{'  —  ' + str(n) + ' series' if n else ''}")
-        self._update_spin_wheel()
-        self._apply_filter()
+        self._virt_items = []
+        self._virt_start = 0
+        self._virt_prefix = []
 
     def _scroll_to_card(self, series_id: int):
-        """Scroll the left watching list to make the given series card visible."""
-        card = self._cards.get(series_id)
-        if card and self._left_scroll:
-            QTimer.singleShot(0, lambda: self._left_scroll.ensureWidgetVisible(card))
+        """Scroll to the position of the given series in the virtual list."""
+        for i, s in enumerate(self._virt_items):
+            if s.id == series_id:
+                y = self._virt_prefix[i] if i < len(self._virt_prefix) else 0
+                QTimer.singleShot(0, lambda y=y:
+                    self._left_scroll.verticalScrollBar().setValue(y))
+                return
 
     def _toggle_kind_filter(self, kind: str):
         self._kind_filter = None if self._kind_filter == kind else kind
@@ -514,50 +641,41 @@ class MainWindow(QMainWindow):
         self._spin_start_btn.setVisible(False)
         self._spin_btn.setEnabled(bool(items))
 
-    def _apply_filter(self):
-        query = self._search.text().strip().lower()
-        if query:
-            if self._left_pending:
-                self._flush_pending_to_layout(count=None)
-                self._bg_build_timer.stop()
-            if self._prebuilt_queue:
-                self._flush_prebuilt_to_layout(count=None)
+    def _apply_filter(self, reset_scroll: bool = True):
+        """Rebuild the virtual left-column list for the current filter/search state.
+
+        reset_scroll=True  — resets to the top (used for filter/search changes).
+        reset_scroll=False — preserves virt_start (used for in-place data mutations).
+        """
         has_series = bool(self._tracker.series)
         self._search.setVisible(has_series)
         self._filter_row.setVisible(has_series)
 
-        # Left column
-        visible_kinds: set[str] = set()
-        any_left = False
-        for sid, card in self._cards.items():
-            s = self._tracker._find(sid)
-            name_ok = not query or (s and (
-                query in s.name.lower() or
-                any(query in a.lower() for a in s.alt_names)
-            ))
-            kind_ok = self._kind_filter is None or (s and s.kind == self._kind_filter)
-            visible = name_ok and kind_ok
-            card.setVisible(visible)
-            if visible and s:
-                any_left = True
-                visible_kinds.add(s.kind)
+        # ── Left column: virtual recycling list ─────────────────────
+        if reset_scroll:
+            self._virt_start = 0
 
-        for kind, hdr in self._section_headers.items():
-            hdr.setVisible(kind in visible_kinds)
+        self._build_virt_items()
+        self._build_virt_prefix()
+        self._setup_virt_list()
 
-        self._list_container.setVisible(any_left)
+        N = len(self._virt_items)
+        self._list_container.setVisible(N > 0)
+
         if not has_series:
             self._empty_label.setText("📺\n\nNo series yet — add one above!")
             self._empty_label.setVisible(True)
-        elif not any_left:
-            txt = (f"No results for \"{self._search.text().strip()}\""
+        elif N == 0:
+            query = self._search.text().strip()
+            txt = (f"No results for \"{query}\""
                    if query else "All series are in plan to watch.")
             self._empty_label.setText(txt)
             self._empty_label.setVisible(True)
         else:
             self._empty_label.setVisible(False)
 
-        # Right column (P2W)
+        # ── Right column (P2W) ───────────────────────────────────────
+        query = self._search.text().strip().lower()
         any_p2w = False
         for sid, card in self._p2w_cards.items():
             s = self._tracker._find(sid)
@@ -651,93 +769,33 @@ class MainWindow(QMainWindow):
         self._toast.show_message(msg)
 
     def _insert_or_replace_card(self, s):
-        """Insert or replace cards for series s without a full rebuild."""
-        self._left_content.setUpdatesEnabled(False)
+        """Update both columns for series s after a data mutation.
+
+        If the card for s is currently in the pool we refresh it in-place
+        (preserving scroll position).  Either way we also rebuild the prefix
+        sums so scrollbar height stays accurate, then rebuild the P2W column.
+        """
+        has_p2w = any(v.p2w for v in s.seasons.values())
+
+        # ── Right column (P2W) ───────────────────────────────────────
         self._right_content.setUpdatesEnabled(False)
         try:
-            self._do_insert_or_replace_card(s)
+            old_p2w = self._p2w_cards.pop(s.id, None)
+            if old_p2w:
+                self._p2w_layout.removeWidget(old_p2w)
+                old_p2w.setParent(None)
+            if has_p2w:
+                p2w_card = self._make_p2w_card(s)
+                self._p2w_layout.addWidget(p2w_card)
+                self._p2w_cards[s.id] = p2w_card
         finally:
-            self._left_content.setUpdatesEnabled(True)
             self._right_content.setUpdatesEnabled(True)
+
         n = len(self._tracker.series)
         self.setWindowTitle(f"My Series Tracker{'  —  ' + str(n) + ' series' if n else ''}")
         self._update_spin_wheel()
-        self._apply_filter()
-
-    def _do_insert_or_replace_card(self, s):
-        has_active = any(not v.p2w for v in s.seasons.values())
-        has_p2w    = any(v.p2w    for v in s.seasons.values())
-
-        # ── Left column ──────────────────────────────────────────
-        old_card = self._cards.pop(s.id, None)
-        if old_card:
-            idx = self._list_layout.indexOf(old_card)
-            self._list_layout.removeWidget(old_card)
-            old_card.setParent(None)
-        else:
-            idx = -1
-
-        if has_active:
-            card = self._make_left_card(s)
-            self._cards[s.id] = card
-
-            if idx >= 0:
-                # Replace in-place at the same position
-                self._list_layout.insertWidget(idx, card)
-            else:
-                # Insert at end of the kind group, creating header if needed
-                insert_idx = self._kind_group_end_index(s.kind)
-                self._list_layout.insertWidget(insert_idx, card)
-
-        # ── Right column (P2W) ───────────────────────────────────
-        old_p2w = self._p2w_cards.pop(s.id, None)
-        if old_p2w:
-            self._p2w_layout.removeWidget(old_p2w)
-            old_p2w.setParent(None)
-
-        if has_p2w:
-            p2w_card = self._make_p2w_card(s)
-            self._p2w_layout.addWidget(p2w_card)
-            self._p2w_cards[s.id] = p2w_card
-
-    def _kind_group_end_index(self, kind: str) -> int:
-        """Return the layout index just after the last card of `kind`, creating the section header if absent."""
-        kind_order = [k for k, _ in self._KIND_LABELS]
-        label_map  = {k: lbl for k, lbl in self._KIND_LABELS}
-
-        # Collect cards per kind from current layout state
-        cards_by_kind: dict[str, list[int]] = {k: [] for k in kind_order}
-        for i in range(self._list_layout.count()):
-            w = self._list_layout.itemAt(i).widget()
-            if isinstance(w, SeriesCard):
-                cards_by_kind.get(w._series.kind, []).append(i)
-
-        if cards_by_kind[kind]:
-            # Kind group already exists — insert after its last card
-            return cards_by_kind[kind][-1] + 1
-
-        # Kind group doesn't exist yet — find where it should go based on kind order
-        insert_before = self._list_layout.count()
-        for k in kind_order:
-            if k == kind:
-                break
-            # skip kinds that come before ours
-        for k in kind_order[kind_order.index(kind) + 1:]:
-            if cards_by_kind[k]:
-                # Find the header for this kind and insert before it
-                for i in range(self._list_layout.count()):
-                    w = self._list_layout.itemAt(i).widget()
-                    if w is self._section_headers.get(k):
-                        insert_before = i
-                        break
-                break
-
-        # Create and insert the section header
-        hdr = QLabel(label_map[kind])
-        hdr.setObjectName("list_section_lbl")
-        self._list_layout.insertWidget(insert_before, hdr)
-        self._section_headers[kind] = hdr
-        return insert_before + 1  # card goes right after the new header
+        # Rebuild left column in-place (preserves scroll position)
+        self._apply_filter(reset_scroll=False)
 
     def _on_watch(self, series_id: int, season_num: int):
         finished = self._tracker.watch_one(series_id, season_num)
@@ -763,21 +821,7 @@ class MainWindow(QMainWindow):
         if dlg:
             dlg.close()
 
-        keep = []
-        for item in self._prebuilt_queue:
-            if item[0] == 'left' and item[1] == series_id:
-                item[2].setParent(None)
-            else:
-                keep.append(item)
-        self._prebuilt_queue = keep
-
-        # Remove card from left column directly — no full rebuild needed
-        card = self._cards.pop(series_id, None)
-        if card:
-            self._list_layout.removeWidget(card)
-            card.setParent(None)
-
-        # Remove P2W card from right column directly
+        # Remove P2W card immediately (right column)
         p2w_card = self._p2w_cards.pop(series_id, None)
         if p2w_card:
             self._p2w_layout.removeWidget(p2w_card)
@@ -786,11 +830,12 @@ class MainWindow(QMainWindow):
         n = len(self._tracker.series)
         self.setWindowTitle(f"My Series Tracker{'  —  ' + str(n) + ' series' if n else ''}")
         self._update_spin_wheel()
-        self._apply_filter()   # hides section headers whose group is now empty
+        # Rebuild virtual list (the deleted item is gone from tracker, so it
+        # won't appear in the new virt_items); preserve scroll position.
+        self._apply_filter(reset_scroll=False)
         self._toast.show_message("Removed.")
 
     def _on_auto_save(self, series_id: int, name: str, kind: str, alt_names: list, season_edits: dict):
-        old_kind = getattr(self._tracker._find(series_id), "kind", None)
         self._tracker.apply_edit(series_id, name, kind, alt_names, season_edits)
         self._schedule_save()
 
@@ -798,19 +843,19 @@ class MainWindow(QMainWindow):
         if not s:
             return
 
-        if kind != old_kind:
-            self._insert_or_replace_card(s)
-            return
-
+        # Refresh the card if it's currently visible in the pool
         card = self._cards.get(series_id)
         if card:
-            card.update_name(s.name, s.alt_names)
-            for sn_str in season_edits:
-                card.apply_watch(int(sn_str), s.seasons[sn_str])
+            card.refresh(s)
+
         dlg = self._edit_dialogs.get(series_id)
         if dlg and season_edits:
             for sn_str in season_edits:
                 dlg.sync_season_watched(int(sn_str), s.seasons[sn_str].watched)
+
+        # Kind change moves the series to a different position in the grouped list
+        # → full filter rebuild so the ordering stays correct
+        self._insert_or_replace_card(s)
 
     def _on_p2w_auto_save(self, series_id: int, name: str, season_edits: dict):
         """Handle name/label/episode edits from the P2W card edit panel."""
@@ -900,10 +945,6 @@ class MainWindow(QMainWindow):
         dlg.closed.connect(lambda sid: self._edit_dialogs.pop(sid, None))
         self._edit_dialogs[series_id] = dlg
         dlg.show()
-
-    def _on_season_dirty(self, series_id: int):
-        self._tracker._mark_dirty()
-        self._schedule_save()
 
     def _on_eject_season(self, series_id: int, season_key: str, new_name: str):
         s = self._tracker._find(series_id)
