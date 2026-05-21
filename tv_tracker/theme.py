@@ -123,6 +123,12 @@ QLabel#series_altname {{
     background: transparent;
 }}
 QLabel#season_label    {{ color: {MUTED}; font-size: 12px; background: transparent; }}
+QWidget#p2w_season_row {{
+    border-left: 2px dashed {HINT};
+    padding-left: 6px;
+    background: transparent;
+}}
+QLabel#p2w_season_label {{ color: {HINT}; font-size: 12px; font-style: italic; background: transparent; }}
 QLabel#season_sublabel {{ color: {HINT}; font-size: 10px; background: transparent; }}
 QLabel#eps_label     {{ color: {MUTED}; font-size: 11px; background: transparent; }}
 QLabel#field_label   {{ color: {MUTED}; font-size: 12px; background: transparent; }}

@@ -238,6 +238,41 @@ class SeasonRow(QWidget):
             self.rate_requested.emit(self._series_id, self._season_num, val)
 
 
+class P2WSeasonRow(QWidget):
+    """Slim read-only row shown in the left column for plan-to-watch seasons."""
+
+    def __init__(self, series_id: int, season_num: int, season: "Season",
+                 is_first: bool = True, parent: QWidget = None):
+        super().__init__(parent)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        self._sep = _hline()
+        outer.addWidget(self._sep)
+
+        row_w = QWidget()
+        row_w.setObjectName("p2w_season_row")
+        rl = QHBoxLayout(row_w)
+        rl.setContentsMargins(6, 4, 0, 4)
+        rl.setSpacing(6)
+
+        self._lbl = _lbl("", "p2w_season_label")
+        self._lbl.setWordWrap(True)
+        rl.addWidget(self._lbl, 1)
+
+        outer.addWidget(row_w)
+        self.update_data(series_id, season_num, season, is_first)
+
+    def update_data(self, series_id: int, season_num: int, season: "Season",
+                    is_first: bool = True):
+        self._sep.setVisible(not is_first)
+        name = season.label or f"Season {season_num}"
+        eps = season.episodes
+        ep_str = f"{eps} ep{'s' if eps != 1 else ''}"
+        self._lbl.setText(f"📋  {name}  ·  {ep_str}")
+
+
 class SeriesCard(QFrame):
     watch_requested    = pyqtSignal('qlonglong', int)
     delete_requested   = pyqtSignal('qlonglong')
@@ -250,6 +285,8 @@ class SeriesCard(QFrame):
         self._series = series
         # _row_list: ordered pool of SeasonRow widgets, reused across refresh()
         self._row_list: list[SeasonRow] = []
+        # _p2w_row_list: ordered pool of P2WSeasonRow widgets
+        self._p2w_row_list: list[P2WSeasonRow] = []
         # _season_rows: sn_str → row, rebuilt by _sync_seasons for apply_watch
         self._season_rows: dict[str, SeasonRow] = {}
         # Cache completed state so _recheck_completed only repolishes on change
@@ -326,6 +363,11 @@ class SeriesCard(QFrame):
              if not series.seasons[k].p2w],
             key=lambda x: x[0],
         )
+        p2w = sorted(
+            [(int(k), series.seasons[k]) for k in series.seasons
+             if series.seasons[k].p2w],
+            key=lambda x: x[0],
+        )
         N    = len(active)
         have = len(self._row_list)
 
@@ -351,6 +393,22 @@ class SeriesCard(QFrame):
 
         # Rebuild the dict used by apply_watch
         self._season_rows = {str(active[i][0]): self._row_list[i] for i in range(N)}
+
+        # ── P2W season rows ──────────────────────────────────────
+        NP    = len(p2w)
+        haveP = len(self._p2w_row_list)
+        for i in range(min(NP, haveP)):
+            sn_num, season = p2w[i]
+            # P2W rows always show a separator — they follow active rows
+            self._p2w_row_list[i].update_data(series.id, sn_num, season, is_first=False)
+            self._p2w_row_list[i].show()
+        for i in range(haveP, NP):
+            sn_num, season = p2w[i]
+            row = P2WSeasonRow(series.id, sn_num, season, is_first=False)
+            self._seasons_layout.addWidget(row)
+            self._p2w_row_list.append(row)
+        for i in range(NP, haveP):
+            self._p2w_row_list[i].hide()
 
     # ── Public API ───────────────────────────────────────────────
 
