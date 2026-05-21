@@ -118,21 +118,31 @@ class Tracker:
         self._is_sorted = True
         self._mark_dirty()
 
-    def find_by_name(self, name: str) -> Optional["Series"]:
-        """Locate a series by name.
+    def find_by_name(self, name: str, kind: Optional[str] = None) -> Optional["Series"]:
+        """Locate a series by name (and optionally kind).
 
         Uses binary search (O(log n) comparisons) when the list is known to be
         sorted — e.g. after sort_alphabetically() or a sorted load. Falls back
         to a linear scan otherwise so correctness is never sacrificed.
+
+        When *kind* is given, only a series matching both name and kind is
+        returned, allowing same-name entries of different types to coexist.
         """
         target = name.lower()
         if self._is_sorted:
             keys = self._name_keys()
             i = bisect.bisect_left(keys, target)
-            if i < len(self.series) and self.series[i].name.lower() == target:
-                return self.series[i]
+            # Walk the run of same-name entries (different kinds may be adjacent)
+            while i < len(self.series) and self.series[i].name.lower() == target:
+                if kind is None or self.series[i].kind == kind:
+                    return self.series[i]
+                i += 1
             return None
-        return next((s for s in self.series if s.name.lower() == target), None)
+        return next(
+            (s for s in self.series
+             if s.name.lower() == target and (kind is None or s.kind == kind)),
+            None,
+        )
 
     # ── Mutations ────────────────────────────────────────────────
 

@@ -741,7 +741,8 @@ class MainWindow(QMainWindow):
 
     def _on_add(self, name: str, season: int, episodes: int, label: str, kind: str, p2w: bool):
         # Smart add: binary search when sorted, linear fallback otherwise
-        existing = self._tracker.find_by_name(name)
+        # Match by name *and* kind so the same title can exist as different types
+        existing = self._tracker.find_by_name(name, kind)
         if existing:
             key = str(season)
             if key in existing.seasons:
@@ -1045,7 +1046,7 @@ class MainWindow(QMainWindow):
         added = 0
         base_id = int(time.time() * 1000)
         for i, (name, seasons) in enumerate(series_list):
-            if self._tracker.find_by_name(name):
+            if self._tracker.find_by_name(name, "anime"):
                 skipped.append(name)
                 continue
             s = Series(id=base_id + i, name=name, kind="anime", seasons=seasons)
