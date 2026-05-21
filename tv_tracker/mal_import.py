@@ -128,8 +128,11 @@ def parse_mal_xml(path: str) -> list[dict]:
 
 
 def _make_season(entry: dict, label: str) -> Season:
+    episodes = entry["episodes"]
+    if not episodes:
+        episodes = entry["watched"] + 1 if entry["watched"] else 12
     return Season(
-        episodes=entry["episodes"],
+        episodes=episodes,
         watched=entry["watched"],
         rating=entry["score"],
         label=label,

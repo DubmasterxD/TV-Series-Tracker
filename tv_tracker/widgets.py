@@ -37,6 +37,9 @@ class ClampSpinBox(QSpinBox):
     def textFromValue(self, value: int) -> str:
         return str(value)
 
+    def wheelEvent(self, event):
+        event.ignore()
+
 
 _KIND_ICON: dict[str, str] = {
     "tv":     "📺",
@@ -528,7 +531,7 @@ class SeriesEditDialog(QWidget):
         sc.setContentsMargins(0, 0, 0, 0)
         sc.setSpacing(4)
         sc.addWidget(_lbl("Season #", "field_label"))
-        self._new_sn = QSpinBox()
+        self._new_sn = ClampSpinBox()
         self._new_sn.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
         self._new_sn.setMinimum(1)
         self._new_sn.setMaximum(999)
@@ -540,7 +543,7 @@ class SeriesEditDialog(QWidget):
         epc.setContentsMargins(0, 0, 0, 0)
         epc.setSpacing(4)
         epc.addWidget(_lbl("Episodes", "field_label"))
-        self._new_eps = QSpinBox()
+        self._new_eps = ClampSpinBox()
         self._new_eps.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
         self._new_eps.setMinimum(1)
         self._new_eps.setMaximum(9999)
@@ -618,7 +621,7 @@ class SeriesEditDialog(QWidget):
         ec.setContentsMargins(0, 0, 0, 0)
         ec.setSpacing(4)
         ec.addWidget(_lbl("Total episodes", "field_label"))
-        eps_spin = QSpinBox()
+        eps_spin = ClampSpinBox()
         eps_spin.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
         eps_spin.setMinimum(1)
         eps_spin.setMaximum(9999)
@@ -867,7 +870,7 @@ class P2WCard(QFrame):
         ec.setContentsMargins(0, 0, 0, 0)
         ec.setSpacing(4)
         ec.addWidget(_lbl("Total episodes", "field_label"))
-        eps_spin = QSpinBox()
+        eps_spin = ClampSpinBox()
         eps_spin.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
         eps_spin.setMinimum(1)
         eps_spin.setMaximum(9999)
@@ -1175,7 +1178,7 @@ class AddForm(QFrame):
         sc.setContentsMargins(0, 0, 0, 0)
         sc.setSpacing(4)
         sc.addWidget(_lbl("Season", "field_label"))
-        self._season = QSpinBox()
+        self._season = ClampSpinBox()
         self._season.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
         self._season.setMinimum(1)
         self._season.setMaximum(999)
@@ -1189,7 +1192,7 @@ class AddForm(QFrame):
         ec.setContentsMargins(0, 0, 0, 0)
         ec.setSpacing(4)
         ec.addWidget(_lbl("Total episodes", "field_label"))
-        self._episodes = QSpinBox()
+        self._episodes = ClampSpinBox()
         self._episodes.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
         self._episodes.setMinimum(1)
         self._episodes.setMaximum(9999)
