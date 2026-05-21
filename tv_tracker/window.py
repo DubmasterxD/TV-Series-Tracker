@@ -654,6 +654,7 @@ class MainWindow(QMainWindow):
         # ── Left column: virtual recycling list ─────────────────────
         if reset_scroll:
             self._virt_start = 0
+            self._left_scroll.verticalScrollBar().setValue(0)
 
         self._build_virt_items()
         self._build_virt_prefix()
