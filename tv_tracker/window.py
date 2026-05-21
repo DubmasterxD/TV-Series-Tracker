@@ -879,6 +879,7 @@ class MainWindow(QMainWindow):
         p2w_card = self._p2w_cards.get(series_id)
         if p2w_card:
             p2w_card.update_name(name)
+            p2w_card.update_row_labels(season_edits)
 
     def _on_rate(self, series_id: int, season_num: int, rating: int):
         self._tracker.rate_season(series_id, season_num, rating)

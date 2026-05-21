@@ -755,6 +755,7 @@ class P2WCard(QFrame):
         self.setObjectName("p2w_card")
         self._series = series
         self._p2w_season_inputs: dict[str, dict] = {}
+        self._row_labels: dict[str, "QLabel"] = {}
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -890,6 +891,7 @@ class P2WCard(QFrame):
         lbl = _lbl(label_text, "season_label")
         lbl.setWordWrap(True)
         rl.addWidget(lbl, 1)
+        self._row_labels[str(season_num)] = lbl
 
         rl.addWidget(_lbl(f"{season.episodes} ep{'s' if season.episodes != 1 else ''}", "eps_label"))
 
@@ -920,6 +922,14 @@ class P2WCard(QFrame):
 
     def update_name(self, name: str):
         self._name_lbl.setText(name)
+
+    def update_row_labels(self, season_edits: dict):
+        """Refresh the body-row season labels after an edit-panel save."""
+        for sn_str, data in season_edits.items():
+            lbl = self._row_labels.get(sn_str)
+            if lbl:
+                text = data["label"] or f"Season {sn_str}"
+                lbl.setText(text)
 
 
 class SpinWheel(QWidget):
